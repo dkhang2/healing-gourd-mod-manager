@@ -1,2 +1,2 @@
 # healing-gourd-mod-manager
-A Windows desktop manager for Sekiro mods.
+A mod manager for Sekiro.
