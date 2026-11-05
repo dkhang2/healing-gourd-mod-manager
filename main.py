@@ -26,6 +26,7 @@ STATE_FILE = DATA_DIR / ".sekiro_mod_manager.json"
 MIGRATION_MARKER = DATA_DIR / ".legacy-migration-complete"
 ASSETS = DATA_DIR / "Assets"
 DEFAULT_ICON_NAME = "healing-gourd.ico"
+DEFAULT_BACKGROUND_NAME = "sekiro-background.png"
 MAX_ARCHIVE_FILES = 20000
 MAX_ARCHIVE_SIZE = 2 * 1024 * 1024 * 1024
 ARCHIVE_RESERVED_NAMES = {
@@ -37,6 +38,19 @@ MOD_CONTENT_DIR_NAMES = {
     "asset", "assets", "chr", "event", "font", "map", "menu", "mtd", "msg",
     "movie", "obj", "other", "param", "parts", "script", "sfx", "sound",
 }
+
+
+def bundled_asset_path(name: str) -> Path:
+    bundle_dir = getattr(sys, "_MEIPASS", BASE)
+    return Path(bundle_dir) / "Assets" / name
+
+
+def resolve_background_image_path(background: Optional[str]) -> Optional[Path]:
+    if background:
+        image_path = ASSETS / background
+    else:
+        image_path = bundled_asset_path(DEFAULT_BACKGROUND_NAME)
+    return image_path if image_path.is_file() else None
 
 
 class ManagerState(TypedDict):
@@ -345,12 +359,11 @@ def install_external_mod(game_dir: Path, mod_name: str) -> int:
             f"A library mod named '{mod_name}' already exists. Select that library entry instead."
         )
     import_mod(str(source), mod_name)
-    return launch_modded_game(game_dir, mod_name)
+    enable_mod(mod_name)
+    return launch_modded_game(game_dir)
 
 
-def launch_modded_game(game_dir: Path, mod_name: Optional[str] = None) -> int:
-    if mod_name and mod_name not in load_state()["mods"]:
-        enable_mod(mod_name)
+def launch_modded_game(game_dir: Path) -> int:
     launch_game(game_dir)
     return len(load_state()["mods"])
 
@@ -866,17 +879,16 @@ def launch_gui() -> None:
             self.header_photo = None
             self.header_scaled_photo = None
             background = load_state()["appearance"]["background_image"]
-            if background:
-                image_path = ASSETS / background
-                if image_path.is_file():
-                    try:
-                        self.header_photo = tk.PhotoImage(file=str(image_path))
-                    except tk.TclError:
-                        messagebox.showwarning(
-                            "Background image unavailable",
-                            f"Could not load the saved background image:\n{image_path}",
-                            parent=self.root,
-                        )
+            image_path = resolve_background_image_path(background)
+            if image_path is not None:
+                try:
+                    self.header_photo = tk.PhotoImage(file=str(image_path))
+                except tk.TclError:
+                    messagebox.showwarning(
+                        "Background image unavailable",
+                        f"Could not load the background image:\n{image_path}",
+                        parent=self.root,
+                    )
             self.draw_header()
             self.apply_app_icon(show_error=False)
 
@@ -944,7 +956,7 @@ def launch_gui() -> None:
             ttk.Label(body, text="BACKGROUND IMAGE", style="Section.TLabel").pack(anchor="w")
             ttk.Label(
                 body,
-                text="PNG or GIF. It appears as a cropped banner behind the title.",
+                text="A Sekiro banner is shown by default. Choose a PNG or GIF to replace it.",
                 style="Muted.TLabel",
             ).pack(anchor="w", pady=(3, 8))
             background_actions = ttk.Frame(body)
@@ -1280,7 +1292,6 @@ def launch_gui() -> None:
             game_dir = Path(self.game_dir.get().strip().strip('"')).expanduser().resolve()
             selected = self.selected_mod()
             item = self.mod_items.get(selected) if selected else None
-            mod_name = item[0] if item is not None and item[1] else None
             nested_name = item[0] if item is not None and not item[1] else None
             nested_path = game_dir / "mods" / nested_name if nested_name else None
             if nested_path is not None and is_nested_mod_folder(nested_path):
@@ -1299,7 +1310,7 @@ def launch_gui() -> None:
                     if nested_path is not None and is_nested_mod_folder(nested_path):
                         enabled_count = install_external_mod(game_dir, nested_name)
                     else:
-                        enabled_count = launch_modded_game(game_dir, mod_name)
+                        enabled_count = launch_modded_game(game_dir)
                 self.refresh()
                 self.status.set(
                     f"Sekiro launched  ·  {enabled_count} manager mod(s) enabled"

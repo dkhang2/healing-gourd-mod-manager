@@ -108,24 +108,22 @@ class LaunchGameTests(unittest.TestCase):
 
             popen.assert_called_once_with([str(executable)], cwd=str(game_dir))
 
-    def test_launching_selected_mod_enables_it_before_game(self) -> None:
+    def test_launching_does_not_implicitly_enable_disabled_mods(self) -> None:
         game_dir = Path("C:/Sekiro")
         calls: list[str] = []
-        state = {"mods": {}}
-
-        def enable_mod(name: str) -> None:
-            calls.append(f"enable:{name}")
-            state["mods"][name] = {}
+        state = {"mods": {"Other Mod": {"parts/chr/other.bin": "hash"}}}
 
         with (
             mock.patch.object(main, "load_state", side_effect=lambda: state),
-            mock.patch.object(main, "enable_mod", side_effect=enable_mod),
+            mock.patch.object(main, "enable_mod") as enable_mod,
             mock.patch.object(main, "launch_game", side_effect=lambda _game_dir: calls.append("launch")),
         ):
-            enabled_count = main.launch_modded_game(game_dir, "Test Mod")
+            enabled_count = main.launch_modded_game(game_dir)
 
         self.assertEqual(enabled_count, 1)
-        self.assertEqual(calls, ["enable:Test Mod", "launch"])
+        self.assertEqual(calls, ["launch"])
+        self.assertNotIn("Test Mod", state["mods"])
+        enable_mod.assert_not_called()
 
     def test_launching_current_setup_does_not_change_enabled_mods(self) -> None:
         game_dir = Path("C:/Sekiro")
@@ -205,6 +203,47 @@ class LaunchGameTests(unittest.TestCase):
 
             self.assertIn(("Phantom Blade Zero", 1, "Nested - inactive"), installed)
             self.assertIn(("parts", 1, "External"), installed)
+
+
+class BackgroundImageTests(unittest.TestCase):
+    def test_uses_bundled_background_when_no_custom_image_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle_dir = Path(temporary)
+            default_image = bundle_dir / "Assets" / main.DEFAULT_BACKGROUND_NAME
+            default_image.parent.mkdir()
+            default_image.write_bytes(b"background")
+
+            with mock.patch.object(main.sys, "_MEIPASS", str(bundle_dir), create=True):
+                self.assertEqual(main.resolve_background_image_path(None), default_image)
+
+    def test_custom_background_overrides_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            custom_image = root / "Assets" / "background.png"
+            custom_image.parent.mkdir()
+            custom_image.write_bytes(b"custom")
+            default_image = root / "bundle" / "Assets" / main.DEFAULT_BACKGROUND_NAME
+            default_image.parent.mkdir(parents=True)
+            default_image.write_bytes(b"default")
+
+            with (
+                mock.patch.object(main, "ASSETS", custom_image.parent),
+                mock.patch.object(main.sys, "_MEIPASS", str(root / "bundle"), create=True),
+            ):
+                self.assertEqual(main.resolve_background_image_path("background.png"), custom_image)
+
+    def test_missing_custom_background_does_not_replace_it_with_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            default_image = root / "Assets" / main.DEFAULT_BACKGROUND_NAME
+            default_image.parent.mkdir()
+            default_image.write_bytes(b"default")
+
+            with (
+                mock.patch.object(main, "ASSETS", root / "custom-assets"),
+                mock.patch.object(main.sys, "_MEIPASS", str(root), create=True),
+            ):
+                self.assertIsNone(main.resolve_background_image_path("missing.png"))
 
 
 if __name__ == "__main__":

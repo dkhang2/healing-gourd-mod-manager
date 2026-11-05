@@ -39,9 +39,15 @@ set "RELEASE_DIR=%~dp0release"
 set "RELEASE_ZIP=%RELEASE_DIR%\Healing Gourd Mod Manager Portable.zip"
 set "RELEASE_TEMP=%RELEASE_DIR%\Healing Gourd Mod Manager Portable.tmp.zip"
 set "ICON=%~dp0Assets\healing-gourd.ico"
+set "BACKGROUND=%~dp0Assets\sekiro-background.png"
 
 if not exist "%ICON%" (
     echo Could not find the default app icon: "%ICON%"
+    popd
+    exit /b 1
+)
+if not exist "%BACKGROUND%" (
+    echo Could not find the default background image: "%BACKGROUND%"
     popd
     exit /b 1
 )
@@ -62,6 +68,7 @@ if errorlevel 1 (
     --icon "%ICON%" ^
     --add-data "%~dp0Assets\healing-gourd.ico;Assets" ^
     --add-data "%~dp0Assets\healing-gourd.png;Assets" ^
+    --add-data "%BACKGROUND%;Assets" ^
     --name "Healing Gourd Mod Manager" ^
     --distpath "%PYINSTALLER_DIST%" ^
     --workpath "%PYINSTALLER_WORK%" ^
@@ -86,9 +93,9 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; try { Compress-Archive -Path '%PACKAGE_SOURCE%\*' -DestinationPath '%RELEASE_TEMP%' -CompressionLevel Optimal -Force } catch { Write-Error $_; exit 1 }"
+"%BUILD_PYTHON%" -c "import pathlib, zipfile; source = pathlib.Path(r'%PACKAGE_SOURCE%'); destination = pathlib.Path(r'%RELEASE_TEMP%'); archive = zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED, compresslevel=6); [archive.write(path, path.relative_to(source).as_posix()) for path in source.rglob('*') if path.is_file()]; archive.close()"
 if errorlevel 1 (
-    echo Could not create the portable ZIP.
+    echo Could not create the portable ZIP with Python.
     popd
     exit /b 1
 )

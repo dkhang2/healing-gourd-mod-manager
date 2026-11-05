@@ -5,9 +5,10 @@ game's `mods` folder.
 
 ## Install and run
 
-1. Download `Healing Gourd Mod Manager Portable.zip`.
-2. Extract **all** files from the ZIP into a folder you can write to.
-3. Run `Healing Gourd Mod Manager.exe` from that extracted folder.
+1. Download `Sekiro Mod Engine from Nexus first`.
+2. Download `Healing Gourd Mod Manager Portable.zip`.
+3. Extract **all** files from the ZIP into a folder you can write to.
+4. Run `Healing Gourd Mod Manager.exe` from that extracted folder.
 
 Python is not required to run the packaged app. Keep the `_internal` folder
 beside the executable; do not run the executable from inside the ZIP.
@@ -23,6 +24,9 @@ this location without deleting the originals. To remove the app, close it and
 delete the extracted folder. Remove the Local AppData folder only if you also
 want to delete the saved settings, library, and custom UI assets.
 
+The Sekiro banner is the default background. Use **Customize UI** to choose a
+different PNG or GIF; choose **Clear** to restore the default.
+
 ## Import and run mods
 
 - Choose **Import ZIP...** to import a `.zip` mod archive, or **Import folder...**
@@ -30,9 +34,11 @@ want to delete the saved settings, library, and custom UI assets.
   folder's name is used as the mod name; game content folders such as `parts`
   are not treated as mod names.
 - Select a library mod and choose **Enable** to deploy it into Sekiro's `mods`
-  folder. **Run Modded** automatically enables the selected library mod if
-  needed, then launches `sekiro.exe`. With no library mod selected, it launches
-  the current enabled setup.
+  folder; choose **Disable** to remove that mod's unchanged deployed files while
+  keeping the mod in the library. You can enable multiple mods, and disabled
+  mods stay available until you enable them again. **Run Modded** launches
+  `sekiro.exe` with only the mods currently marked enabled; selecting a disabled
+  library entry does not enable it.
 - Mod Engine loads content directly under its configured override folder (for
   example, `mods\parts\...`). A layout such as `mods\Phantom Blade Zero\parts\...`
   is one folder too deep and will be shown as **Nested - inactive**. Select that
