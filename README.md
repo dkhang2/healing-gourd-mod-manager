@@ -6,7 +6,7 @@ game's `mods` folder.
 ## Install and run
 
 1. Download `Sekiro Mod Engine from Nexus first`.
-2. Download `Healing Gourd Mod Manager Portable.zip from "release" folder`.
+2. Download `Healing Gourd Mod Manager Portable.zip on the Release tab`.
 3. Extract **all** files from the ZIP into a folder you can write to.
 4. Run `Healing Gourd Mod Manager.exe` from that extracted folder.
 
