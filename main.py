@@ -13,7 +13,9 @@ import tempfile
 import zipfile
 from fractions import Fraction
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Callable, Dict, List, Optional, Tuple, TypedDict
+
+import save_manager
 
 
 APP_NAME = "Healing Gourd Mod Manager"
@@ -29,6 +31,7 @@ DEFAULT_ICON_NAME = "healing-gourd.ico"
 DEFAULT_BACKGROUND_NAME = "sekiro-background.png"
 MAX_ARCHIVE_FILES = 20000
 MAX_ARCHIVE_SIZE = 2 * 1024 * 1024 * 1024
+MAX_7Z_LISTING_SIZE = 64 * 1024 * 1024
 ARCHIVE_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{number}" for number in range(1, 10)),
@@ -186,6 +189,58 @@ def validate_mod_name(name: str) -> None:
         raise ValueError("Mod name must be a non-empty folder name.")
 
 
+def _validate_archive_member_path(raw_path: str, archive_format: str) -> PurePosixPath:
+    normalized = raw_path.replace("\\", "/")
+    relative = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(normalized)
+    parts = relative.parts
+    if (
+        not normalized
+        or relative.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(
+            any(char in part for char in '<>:"|?*')
+            or part.endswith((" ", "."))
+            or part.split(".", 1)[0].upper() in ARCHIVE_RESERVED_NAMES
+            for part in parts
+        )
+    ):
+        raise ValueError(f"Unsafe path in {archive_format} archive: {raw_path}")
+    return relative
+
+
+def _install_staged_archive(
+    staging: Path,
+    top_level_names: set[str],
+    has_root_files: bool,
+    source: Path,
+    library: Path,
+    mod_name: Optional[str],
+) -> str:
+    wrapper_name = next(iter(top_level_names)) if len(top_level_names) == 1 else None
+    if (
+        wrapper_name is not None
+        and not has_root_files
+        and wrapper_name.casefold() not in MOD_CONTENT_DIR_NAMES
+    ):
+        content = staging / wrapper_name
+        name = mod_name or wrapper_name
+    else:
+        content = staging
+        name = mod_name or source.stem
+    validate_mod_name(name)
+    destination = library / name
+    if destination.exists():
+        raise ValueError(f"A mod with that name already exists: {name}")
+    if not any(path.is_file() for path in content.rglob("*")):
+        raise ValueError("The archive did not produce any mod files.")
+    shutil.move(str(content), str(destination))
+    return name
+
+
 def extract_mod_archive(
     source: Path,
     library: Path,
@@ -209,24 +264,8 @@ def extract_mod_archive(
 
         for entry in entries:
             raw_path = entry.filename.replace("\\", "/")
-            relative = PurePosixPath(raw_path)
-            windows_path = PureWindowsPath(raw_path)
+            relative = _validate_archive_member_path(raw_path, "ZIP")
             parts = relative.parts
-            if (
-                not raw_path
-                or relative.is_absolute()
-                or windows_path.is_absolute()
-                or windows_path.drive
-                or not parts
-                or any(part in {"", ".", ".."} for part in parts)
-                or any(
-                    any(char in part for char in '<>:"|?*')
-                    or part.endswith((" ", "."))
-                    or part.split(".", 1)[0].upper() in ARCHIVE_RESERVED_NAMES
-                    for part in parts
-                )
-            ):
-                raise ValueError(f"Unsafe path in ZIP archive: {entry.filename}")
 
             mode = entry.external_attr >> 16
             if stat.S_ISLNK(mode):
@@ -286,36 +325,203 @@ def extract_mod_archive(
                 if extracted_size != entry.file_size:
                     raise ValueError(f"Unexpected extracted size for ZIP entry: {entry.filename}")
 
-            wrapper_name = next(iter(top_level_names)) if len(top_level_names) == 1 else None
+            return _install_staged_archive(
+                staging,
+                top_level_names,
+                has_root_files,
+                source,
+                library,
+                mod_name,
+            )
+
+
+def parse_7z_listing(output: str) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    in_listing = False
+    for line in output.splitlines():
+        if line.strip() == "----------":
+            in_listing = True
+            continue
+        if not in_listing:
+            continue
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        if " = " not in line:
+            raise ValueError("Could not safely parse the 7z archive listing.")
+        key, value = line.split(" = ", 1)
+        if key in current:
+            raise ValueError("The 7z archive listing contains ambiguous member metadata.")
+        current[key] = value
+    if current:
+        entries.append(current)
+    if not entries:
+        raise ValueError("The 7z archive is empty or could not be listed.")
+    return entries
+
+
+def extract_7z_archive(
+    source: Path,
+    library: Path,
+    mod_name: Optional[str] = None,
+) -> str:
+    helper = bundled_asset_path("7za.exe")
+    if not helper.is_file():
+        raise ValueError(f"The bundled 7-Zip helper is missing: {helper}")
+
+    with tempfile.TemporaryDirectory(prefix=".import-", dir=library) as temporary:
+        temporary_dir = Path(temporary)
+        listing_path = temporary_dir / "listing.txt"
+        try:
+            with listing_path.open("wb") as listing:
+                result = subprocess.run(
+                    [str(helper), "l", "-slt", "-sccUTF-8", str(source)],
+                    stdout=listing,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Timed out while reading the 7z archive.") from error
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(error or "7-Zip could not read this archive.")
+        listing_size = listing_path.stat().st_size
+        if listing_size > MAX_7Z_LISTING_SIZE:
+            raise ValueError("The 7z archive listing is too large to safely process.")
+        try:
+            output = listing_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("The 7z archive listing is not valid UTF-8.") from error
+        entries = parse_7z_listing(output)
+        if len(entries) > MAX_ARCHIVE_FILES:
+            raise ValueError(f"The 7z archive contains more than {MAX_ARCHIVE_FILES} entries.")
+
+        top_level_names: set[str] = set()
+        seen_paths: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+        seen_prefixes: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+        expected_files: Dict[str, int] = {}
+        has_root_files = False
+        total_size = 0
+
+        for entry in entries:
+            raw_path = entry.get("Path")
+            if raw_path is None:
+                raise ValueError("The 7z archive listing is missing a member path.")
+            relative = _validate_archive_member_path(raw_path, "7z")
+            parts = relative.parts
+            attributes = entry.get("Attributes", "")
+            is_directory = attributes.startswith("D")
+            if "Encrypted" in entry and entry["Encrypted"] not in {"-", "0"}:
+                raise ValueError("Password-protected 7z archives are not supported.")
             if (
-                wrapper_name is not None
-                and not has_root_files
-                and wrapper_name.casefold() not in MOD_CONTENT_DIR_NAMES
+                "Symbolic Link" in entry.get("Type", "")
+                or "symlink" in attributes.casefold()
+                or "lrwx" in attributes.casefold()
             ):
-                content = staging / wrapper_name
-                name = mod_name or wrapper_name
-            else:
-                content = staging
-                name = mod_name or source.stem
-            validate_mod_name(name)
-            destination = library / name
-            if destination.exists():
-                raise ValueError(f"A mod with that name already exists: {name}")
-            if not any(path.is_file() for path in content.rglob("*")):
-                raise ValueError("The ZIP archive did not produce any mod files.")
-            shutil.move(str(content), str(destination))
-            return name
+                raise ValueError(f"Symbolic links are not allowed in 7z archives: {raw_path}")
+
+            folded_parts = tuple(part.casefold() for part in parts)
+            original_parts = tuple(parts)
+            for depth in range(1, len(parts) + 1):
+                folded_prefix = folded_parts[:depth]
+                original_prefix = original_parts[:depth]
+                previous_prefix = seen_prefixes.get(folded_prefix)
+                if previous_prefix is not None and previous_prefix != original_prefix:
+                    raise ValueError(f"Conflicting Windows paths in 7z archive: {raw_path}")
+                seen_prefixes[folded_prefix] = original_prefix
+            previous_parts = seen_paths.get(folded_parts)
+            if previous_parts is not None and previous_parts != original_parts:
+                raise ValueError(f"Duplicate Windows path in 7z archive: {raw_path}")
+            if previous_parts is not None and not is_directory:
+                raise ValueError(f"Duplicate file in 7z archive: {raw_path}")
+            seen_paths[folded_parts] = original_parts
+            top_level_names.add(parts[0])
+            if not is_directory:
+                try:
+                    size = int(entry["Size"])
+                except (KeyError, ValueError) as error:
+                    raise ValueError(f"Invalid file size in 7z archive: {raw_path}") from error
+                if size < 0:
+                    raise ValueError(f"Invalid file size in 7z archive: {raw_path}")
+                total_size += size
+                if total_size > MAX_ARCHIVE_SIZE:
+                    raise ValueError("The 7z archive expands to more than 2 GiB.")
+                if len(parts) == 1:
+                    has_root_files = True
+                expected_files[relative.as_posix()] = size
+
+        if not expected_files:
+            raise ValueError("The 7z archive does not contain any files.")
+
+        staging = temporary_dir / "payload"
+        staging.mkdir()
+        try:
+            result = subprocess.run(
+                [
+                    str(helper),
+                    "x",
+                    "-y",
+                    "-snl-",
+                    "-snh-",
+                    "-sccUTF-8",
+                    "-bso0",
+                    "-bsp0",
+                    "-bse1",
+                    f"-o{staging}",
+                    str(source),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=600,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Timed out while extracting the 7z archive.") from error
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(error or "7-Zip could not extract this archive.")
+
+        actual_files: Dict[str, int] = {}
+        for path in staging.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"Symbolic links are not allowed in 7z archives: {path}")
+            if path.is_file():
+                relative = path.relative_to(staging).as_posix()
+                try:
+                    path.resolve().relative_to(staging.resolve())
+                except ValueError as error:
+                    raise ValueError(f"Unsafe extracted path in 7z archive: {relative}") from error
+                actual_files[relative] = path.stat().st_size
+        if actual_files != expected_files:
+            raise ValueError("The extracted 7z contents did not match the archive listing.")
+
+        return _install_staged_archive(
+            staging,
+            top_level_names,
+            has_root_files,
+            source,
+            library,
+            mod_name,
+        )
 
 
 def import_mod(source_folder: str, mod_name: Optional[str] = None) -> str:
     source = Path(source_folder).expanduser()
-    is_archive = source.is_file() and source.suffix.casefold() == ".zip"
+    archive_suffix = source.suffix.casefold()
+    is_archive = source.is_file() and archive_suffix in {".zip", ".7z"}
     if not is_archive and not source.is_dir():
-        raise ValueError(f"Source mod folder or ZIP archive not found: {source}")
+        raise ValueError(f"Source mod folder or ZIP/7z archive not found: {source}")
 
     LIBRARY.mkdir(parents=True, exist_ok=True)
     if is_archive:
-        name = extract_mod_archive(source, LIBRARY, mod_name)
+        if archive_suffix == ".7z":
+            name = extract_7z_archive(source, LIBRARY, mod_name)
+        else:
+            name = extract_mod_archive(source, LIBRARY, mod_name)
     else:
         name = mod_name or source.name
         validate_mod_name(name)
@@ -542,7 +748,32 @@ def managed_path(mods_dir: Path, relative_path: str) -> Path:
     return destination
 
 
-def enable_mod(mod_name: str) -> None:
+def find_mod_conflicts(
+    mod_name: str,
+    state: Optional[ManagerState] = None,
+) -> List[Tuple[str, List[str]]]:
+    state = state or load_state()
+    mod_folder = LIBRARY / mod_name
+    active_paths: Dict[str, List[str]] = {}
+    for active_name, files in state["mods"].items():
+        if active_name == mod_name:
+            continue
+        for relative in files:
+            active_paths.setdefault(relative.casefold(), []).append(active_name)
+
+    conflicts: Dict[str, List[str]] = {}
+    if not mod_folder.is_dir():
+        return []
+    for path in mod_folder.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            relative = path.relative_to(mod_folder).as_posix()
+            owners = active_paths.get(relative.casefold())
+            if owners:
+                conflicts[relative] = owners
+    return sorted(conflicts.items(), key=lambda item: item[0].casefold())
+
+
+def enable_mod(mod_name: str, allow_conflicts: bool = False) -> None:
     validate_mod_name(mod_name)
     state = load_state()
     mod_folder = LIBRARY / mod_name
@@ -560,39 +791,81 @@ def enable_mod(mod_name: str) -> None:
     if not source_files:
         raise ValueError(f"Mod contains no files: {mod_name}")
 
+    conflicts = find_mod_conflicts(mod_name, state)
+    if conflicts and not allow_conflicts:
+        details = "; ".join(
+            f"{relative} (already provided by {', '.join(owners)})"
+            for relative, owners in conflicts
+        )
+        raise ValueError(
+            f"Mod file conflicts detected: {details}. "
+            "Confirm the overwrite in the app or use --allow-conflicts."
+        )
+
     game_dir = get_game_dir(state)
     mods_dir = game_dir / "mods"
-    records = state["mods"]
-    owned_paths = {
-        relative.casefold()
-        for files in records.values()
-        for relative in files
-    }
+    active_files: Dict[str, List[Tuple[str, str, str]]] = {}
+    for active_name, files in state["mods"].items():
+        for relative, digest in files.items():
+            active_files.setdefault(relative.casefold(), []).append(
+                (active_name, relative, digest),
+            )
 
-    planned: List[Tuple[Path, Path, str]] = []
+    planned: List[Tuple[Path, Path, str, bool]] = []
+    seen_paths: set[str] = set()
     for source in source_files:
         relative = source.relative_to(mod_folder).as_posix()
+        folded_relative = relative.casefold()
+        if folded_relative in seen_paths:
+            raise ValueError(f"Mod contains duplicate paths differing only by case: {relative}")
+        seen_paths.add(folded_relative)
         destination = managed_path(mods_dir, relative)
-        if relative.casefold() in owned_paths or destination.exists() or destination.is_symlink():
+        owners = active_files.get(folded_relative, [])
+        if owners:
+            top_owner, _, expected_hash = owners[-1]
+            if destination.is_symlink() or not destination.is_file():
+                raise ValueError(
+                    f"Cannot safely override managed file; the active copy is missing: {destination}"
+                )
+            if file_hash(destination) != expected_hash:
+                raise ValueError(
+                    f"Cannot safely override managed file because it was modified outside "
+                    f"the manager: {destination} (currently owned by {top_owner})"
+                )
+            planned.append((source, destination, relative, True))
+        elif destination.exists() or destination.is_symlink():
             raise ValueError(f"Deployment conflict; file already exists or is managed: {destination}")
-        planned.append((source, destination, relative))
+        else:
+            planned.append((source, destination, relative, False))
 
     deployed_files: Dict[str, str] = {}
-    copied: List[Path] = []
-    try:
-        for source, destination, relative in planned:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            copied.append(destination)
-            shutil.copy2(source, destination)
-            deployed_files[relative] = file_hash(destination)
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".mod-enable-", dir=mods_dir) as temporary:
+        backup_dir = Path(temporary)
+        backups: Dict[Path, Path] = {}
+        try:
+            for index, (_, destination, _, had_previous_file) in enumerate(planned):
+                if had_previous_file:
+                    backup = backup_dir / str(index)
+                    shutil.copy2(destination, backup)
+                    backups[destination] = backup
 
-        records[mod_name] = deployed_files
-        save_state(state)
-    except (OSError, shutil.Error):
-        for destination in copied:
-            if destination.is_file() or destination.is_symlink():
-                destination.unlink()
-        raise
+            for source, destination, relative, _ in planned:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                deployed_files[relative] = file_hash(destination)
+
+            state["mods"][mod_name] = deployed_files
+            save_state(state)
+        except (OSError, shutil.Error):
+            state["mods"].pop(mod_name, None)
+            for _, destination, _, had_previous_file in planned:
+                backup = backups.get(destination)
+                if backup is not None and backup.is_file():
+                    shutil.copy2(backup, destination)
+                elif not had_previous_file and (destination.is_file() or destination.is_symlink()):
+                    destination.unlink()
+            raise
 
     print(f"Enabled: {mod_name}")
 
@@ -609,8 +882,18 @@ def disable_mod(mod_name: str) -> None:
         raise ValueError("No Sekiro install folder is configured.")
     mods_dir = Path(configured_path) / "mods"
     preserved: List[str] = []
+    active_files: Dict[str, List[Tuple[str, str, str]]] = {}
+    for active_name, active_records in state["mods"].items():
+        for relative, expected_hash in active_records.items():
+            active_files.setdefault(relative.casefold(), []).append(
+                (active_name, relative, expected_hash),
+            )
 
+    planned: List[Tuple[Path, Optional[Path]]] = []
     for relative, expected_hash in files.items():
+        owners = active_files[relative.casefold()]
+        if owners[-1][0] != mod_name:
+            continue
         destination = managed_path(mods_dir, relative)
         if destination.is_symlink() or not destination.is_file():
             preserved.append(relative)
@@ -618,7 +901,59 @@ def disable_mod(mod_name: str) -> None:
         if file_hash(destination) != expected_hash:
             preserved.append(relative)
             continue
-        destination.unlink()
+        previous_owners = owners[:-1]
+        if previous_owners:
+            previous_name, previous_relative, previous_hash = previous_owners[-1]
+            previous_source = managed_path(LIBRARY / previous_name, previous_relative)
+            if (
+                not previous_source.is_file()
+                or previous_source.is_symlink()
+                or file_hash(previous_source) != previous_hash
+            ):
+                preserved.append(relative)
+                continue
+            planned.append((destination, previous_source))
+        else:
+            planned.append((destination, None))
+
+    original_mods = state["mods"].copy()
+    backups: Dict[Path, Path] = {}
+    if planned:
+        with tempfile.TemporaryDirectory(prefix=".mod-disable-", dir=mods_dir) as temporary:
+            backup_dir = Path(temporary)
+            try:
+                for index, (destination, _) in enumerate(planned):
+                    backup = backup_dir / str(index)
+                    shutil.copy2(destination, backup)
+                    backups[destination] = backup
+
+                for destination, source in planned:
+                    if source is None:
+                        destination.unlink()
+                    else:
+                        shutil.copy2(source, destination)
+
+                del state["mods"][mod_name]
+                save_state(state)
+            except (OSError, shutil.Error):
+                state["mods"].clear()
+                state["mods"].update(original_mods)
+                for destination, backup in backups.items():
+                    if backup.is_file():
+                        shutil.copy2(backup, destination)
+                raise
+    else:
+        del state["mods"][mod_name]
+        try:
+            save_state(state)
+        except OSError:
+            state["mods"].clear()
+            state["mods"].update(original_mods)
+            raise
+
+    for destination, source in planned:
+        if source is not None:
+            continue
         parent = destination.parent
         while parent != mods_dir:
             try:
@@ -630,8 +965,6 @@ def disable_mod(mod_name: str) -> None:
                 break
             parent = parent.parent
 
-    del state["mods"][mod_name]
-    save_state(state)
     print(f"Disabled: {mod_name}")
     for relative in preserved:
         print(f"Preserved changed or missing file: {relative}", file=sys.stderr)
@@ -665,6 +998,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     enable_command = commands.add_parser("enable", help="Deploy a mod into Sekiro's mods folder")
     enable_command.add_argument("name", help="Name of the imported mod")
+    enable_command.add_argument(
+        "--allow-conflicts",
+        action="store_true",
+        help="Allow the mod to override same-path files from other enabled mods",
+    )
 
     disable_command = commands.add_parser("disable", help="Remove this manager's unchanged files for a mod")
     disable_command.add_argument("name", help="Name of the enabled mod")
@@ -688,7 +1026,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.command == "import":
             import_mod(args.source, args.name)
         elif args.command == "enable":
-            enable_mod(args.name)
+            enable_mod(args.name, args.allow_conflicts)
         elif args.command == "disable":
             disable_mod(args.name)
         elif args.command == "delete":
@@ -696,7 +1034,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise ValueError("Deletion requires confirmation; rerun with --yes.")
             delete_library_mod(args.name)
         return 0
-    except (OSError, ValueError, shutil.Error, zipfile.BadZipFile) as error:
+    except (
+        OSError,
+        ValueError,
+        shutil.Error,
+        zipfile.BadZipFile,
+        subprocess.SubprocessError,
+    ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
 
@@ -743,13 +1087,105 @@ def launch_gui() -> None:
                       foreground=[("disabled", "#77766f")])
             style.configure("Accent.TButton", background="#9c302a", foreground="#fff0df")
             style.map("Accent.TButton", background=[("active", "#b63b33"), ("disabled", "#402724")])
+            style.configure(
+                "Navigation.TButton",
+                background="#202220",
+                foreground="#d8d0c0",
+                font=("Segoe UI", 10, "bold"),
+                padding=(12, 12),
+                anchor="w",
+                justify="left",
+                borderwidth=0,
+            )
+            style.map(
+                "Navigation.TButton",
+                background=[("active", "#30322f")],
+                foreground=[("active", "#fff1dc")],
+            )
+            style.configure(
+                "Navigation.Active.TButton",
+                background="#4b2723",
+                foreground="#fff1dc",
+                font=("Segoe UI", 10, "bold"),
+                padding=(12, 12),
+                anchor="w",
+                justify="left",
+                borderwidth=0,
+            )
+            style.map(
+                "Navigation.Active.TButton",
+                background=[("active", "#5a302a")],
+            )
             style.configure("Danger.TButton", background="#382321", foreground="#e8a39a")
             style.map("Danger.TButton", background=[("active", "#60302b"), ("disabled", "#25211f")])
 
             outer = ttk.Frame(root, padding=18)
             outer.pack(fill="both", expand=True)
+            workspace = ttk.Frame(outer)
+            workspace.pack(fill="both", expand=True)
+            self.sidebar = ttk.Frame(workspace, style="Panel.TFrame", padding=(12, 14))
+            self.sidebar.pack(side="left", fill="y", padx=(0, 16))
+            self.sidebar.configure(width=204)
+            self.sidebar.pack_propagate(False)
+            ttk.Label(
+                self.sidebar,
+                text="HEALING GOURD",
+                style="Eyebrow.TLabel",
+                background="#1a1c1b",
+            ).pack(anchor="w", padx=8)
+            ttk.Label(
+                self.sidebar,
+                text="Mod Manager",
+                font=("Segoe UI", 15, "bold"),
+                background="#1a1c1b",
+                foreground="#eee5d3",
+            ).pack(anchor="w", padx=8, pady=(2, 18))
+            ttk.Separator(self.sidebar).pack(fill="x", pady=(0, 14))
+            ttk.Label(
+                self.sidebar,
+                text="WORKSPACE",
+                style="Eyebrow.TLabel",
+                background="#1a1c1b",
+            ).pack(anchor="w", padx=8, pady=(0, 8))
+            self.mod_navigation_button = ttk.Button(
+                self.sidebar,
+                text="Mod Manager\nMods, conflicts & library",
+                command=lambda: self.show_workspace_page("mods"),
+                style="Navigation.Active.TButton",
+            )
+            self.mod_navigation_button.pack(fill="x", pady=(0, 6))
+            self.save_navigation_button = ttk.Button(
+                self.sidebar,
+                text="Save Manager\nBackups, profiles & saves",
+                command=lambda: self.show_workspace_page("saves"),
+                style="Navigation.TButton",
+            )
+            self.save_navigation_button.pack(fill="x")
+            self.sidebar_navigation = {
+                "mods": self.mod_navigation_button,
+                "saves": self.save_navigation_button,
+            }
+
+            sidebar_actions = ttk.Frame(self.sidebar, style="Panel.TFrame")
+            sidebar_actions.pack(side="bottom", fill="x", pady=(14, 0))
+            ttk.Separator(sidebar_actions).pack(fill="x", pady=(0, 12))
+            ttk.Button(
+                sidebar_actions,
+                text="Run Modded",
+                command=self.run_modded,
+                style="Accent.TButton",
+            ).pack(fill="x", pady=(0, 6))
+            ttk.Button(
+                sidebar_actions,
+                text="Customize UI",
+                command=self.customize_ui,
+                style="TButton",
+            ).pack(fill="x")
+
+            self.workspace_content = ttk.Frame(workspace)
+            self.workspace_content.pack(side="left", fill="both", expand=True)
             self.header_canvas = tk.Canvas(
-                outer,
+                self.workspace_content,
                 height=146,
                 background="#171918",
                 highlightthickness=1,
@@ -760,15 +1196,18 @@ def launch_gui() -> None:
             self.header_canvas.bind("<Configure>", self.draw_header)
             self.header_photo = None
             self.header_scaled_photo = None
-            self.customize_button = ttk.Button(
-                self.header_canvas,
-                text="Customize UI",
-                command=self.customize_ui,
-                style="TButton",
-            )
             self.refresh_header()
 
-            game_frame = ttk.LabelFrame(outer, text="Sekiro install folder", padding=10)
+            self.workspace_pages = ttk.Frame(self.workspace_content)
+            self.workspace_pages.pack(fill="both", expand=True)
+            self.mod_manager_tab = ttk.Frame(self.workspace_pages, padding=(0, 0, 0, 4))
+            self.save_manager_tab = ttk.Frame(self.workspace_pages, padding=10)
+            self.mod_manager_tab.pack(fill="both", expand=True)
+            self.active_workspace_page = "mods"
+            self.save_manager_built = False
+            self.refresh_save_manager: Optional[Callable[[], None]] = None
+
+            game_frame = ttk.LabelFrame(self.mod_manager_tab, text="Sekiro install folder", padding=10)
             game_frame.pack(fill="x", pady=(0, 14))
             self.game_dir = tk.StringVar(value=load_state()["game_dir"] or "")
             self.game_entry = ttk.Entry(game_frame, textvariable=self.game_dir)
@@ -776,12 +1215,6 @@ def launch_gui() -> None:
             ttk.Button(game_frame, text="Auto-detect", command=self.detect_game_dir).pack(side="left")
             ttk.Button(game_frame, text="Browse...", command=self.browse_game_dir).pack(side="left")
             ttk.Button(game_frame, text="Save path", command=self.save_game_dir).pack(side="left", padx=(8, 0))
-            ttk.Button(
-                game_frame,
-                text="Run Modded",
-                command=self.run_modded,
-                style="Accent.TButton",
-            ).pack(side="left", padx=(8, 0))
             self.game_indicator = tk.StringVar()
             self.game_indicator_label = tk.Label(
                 game_frame, textvariable=self.game_indicator, anchor="w",
@@ -790,10 +1223,10 @@ def launch_gui() -> None:
             self.game_indicator_label.pack(fill="x", pady=(8, 0))
             self.game_dir.trace_add("write", self.update_game_indicator)
 
-            ttk.Label(outer, text="MOD COLLECTION", style="Eyebrow.TLabel").pack(
+            ttk.Label(self.mod_manager_tab, text="MOD COLLECTION", style="Eyebrow.TLabel").pack(
                 anchor="w", pady=(2, 8),
             )
-            list_frame = ttk.Frame(outer)
+            list_frame = ttk.Frame(self.mod_manager_tab)
             list_frame.pack(fill="both", expand=True)
             self.mods = ttk.Treeview(
                 list_frame,
@@ -814,6 +1247,7 @@ def launch_gui() -> None:
             self.mods.tag_configure("external", foreground="#c0b9a9")
             self.mods.tag_configure("mixed", foreground="#d29b62")
             self.mods.tag_configure("nested", foreground="#e08a63")
+            self.mods.tag_configure("conflict", foreground="#e08a63")
             scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.mods.yview)
             self.mods.configure(yscrollcommand=scrollbar.set)
             self.mods.pack(side="left", fill="both", expand=True)
@@ -821,9 +1255,9 @@ def launch_gui() -> None:
             self.mods.bind("<<TreeviewSelect>>", self.update_buttons)
             self.mod_items: Dict[str, Tuple[str, bool, Optional[str]]] = {}
 
-            actions = ttk.Frame(outer)
+            actions = ttk.Frame(self.mod_manager_tab)
             actions.pack(fill="x", pady=(14, 0))
-            ttk.Button(actions, text="Import ZIP...", command=self.import_zip,
+            ttk.Button(actions, text="Import ZIP/7z...", command=self.import_zip,
                        style="Accent.TButton").pack(side="left")
             ttk.Button(actions, text="Import folder...", command=self.import_folder).pack(
                 side="left", padx=(8, 0),
@@ -842,7 +1276,7 @@ def launch_gui() -> None:
             ttk.Button(actions, text="Refresh", command=self.refresh).pack(side="right")
 
             self.status = tk.StringVar(value=f"LIBRARY  ·  {LIBRARY}")
-            status_bar = tk.Frame(outer, background="#1a1c1b", padx=10, pady=8)
+            status_bar = tk.Frame(self.mod_manager_tab, background="#1a1c1b", padx=10, pady=8)
             status_bar.pack(fill="x", pady=(12, 0))
             ttk.Label(status_bar, textvariable=self.status, anchor="w",
                       background="#1a1c1b", foreground="#a79e8e",
@@ -868,6 +1302,29 @@ def launch_gui() -> None:
             y = max(0, (screen_height - height) // 2)
             self.root.geometry(f"{width}x{height}+{x}+{y}")
             self.root.update_idletasks()
+
+        def show_workspace_page(self, page: str) -> None:
+            if page not in {"mods", "saves"}:
+                raise ValueError(f"Unknown workspace page: {page}")
+            self.active_workspace_page = page
+            for child in self.workspace_pages.winfo_children():
+                child.pack_forget()
+            selected_page = self.mod_manager_tab if page == "mods" else self.save_manager_tab
+            selected_page.pack(fill="both", expand=True)
+            for name, button in self.sidebar_navigation.items():
+                button.configure(
+                    style="Navigation.Active.TButton" if name == page else "Navigation.TButton"
+                )
+
+            if page == "saves":
+                if self.header_canvas.winfo_manager():
+                    self.header_canvas.pack_forget()
+                if not self.save_manager_built:
+                    self.build_save_manager_tab()
+                elif self.refresh_save_manager is not None:
+                    self.refresh_save_manager()
+            elif not self.header_canvas.winfo_manager():
+                self.header_canvas.pack(fill="x", before=self.workspace_pages, pady=(0, 16))
 
         def on_root_configure(self, event: object) -> None:
             if getattr(event, "widget", None) is self.root:
@@ -932,10 +1389,6 @@ def launch_gui() -> None:
                 25, 104, anchor="w", text="Manage your collection. Keep your blade sharp.",
                 fill="#d2c8b7", font=("Segoe UI", 10),
             )
-            canvas.create_window(
-                width - 14, 16, anchor="ne", window=self.customize_button,
-            )
-
         def customize_ui(self) -> None:
             dialog = tk.Toplevel(self.root)
             dialog.title("Customize appearance")
@@ -1138,14 +1591,25 @@ def launch_gui() -> None:
                 library_names: set[str] = set()
                 for folder in sorted(path for path in LIBRARY.iterdir() if path.is_dir()):
                     count = sum(1 for path in folder.rglob("*") if path.is_file())
-                    status = "Enabled" if folder.name in state["mods"] else "Disabled"
+                    conflicts = find_mod_conflicts(folder.name, state)
+                    enabled = folder.name in state["mods"]
+                    if conflicts:
+                        status = (
+                            f"Enabled · {len(conflicts)} overlap(s)"
+                            if enabled
+                            else f"Conflict · {len(conflicts)} file(s)"
+                        )
+                        tags = ("conflict",)
+                    else:
+                        status = "Enabled" if enabled else "Disabled"
+                        tags = ("enabled",) if enabled else ()
                     item_id = f"library:{folder.name}"
                     self.mod_items[item_id] = (folder.name, True, None)
                     library_names.add(folder.name.casefold())
                     self.mods.insert(
                         "", "end", iid=item_id,
                         values=(folder.name, "Library", status, count),
-                        tags=("enabled",) if status == "Enabled" else (),
+                        tags=tags,
                     )
 
                 game_dir = Path(self.game_dir.get().strip().strip('"')).expanduser()
@@ -1262,8 +1726,13 @@ def launch_gui() -> None:
 
         def import_zip(self) -> None:
             source = filedialog.askopenfilename(
-                title="Select a mod ZIP archive",
-                filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+                title="Select a mod ZIP or 7z archive",
+                filetypes=[
+                    ("Mod archives", "*.zip *.7z"),
+                    ("ZIP archives", "*.zip"),
+                    ("7-Zip archives", "*.7z"),
+                    ("All files", "*.*"),
+                ],
                 parent=self.root,
             )
             if not source:
@@ -1282,7 +1751,13 @@ def launch_gui() -> None:
                     name = globals()["import_mod"](source)
                 self.refresh()
                 self.status.set(f"Imported: {name}")
-            except (OSError, ValueError, shutil.Error, zipfile.BadZipFile) as error:
+            except (
+                OSError,
+                ValueError,
+                shutil.Error,
+                zipfile.BadZipFile,
+                subprocess.SubprocessError,
+            ) as error:
                 messagebox.showerror("Import failed", str(error), parent=self.root)
 
         def run_modded(self) -> None:
@@ -1306,18 +1781,527 @@ def launch_gui() -> None:
                 ):
                     return
             try:
+                save_settings = save_manager.load_settings(DATA_DIR)
+                save_dir_value = save_settings["save_dir"]
+                if not save_dir_value:
+                    discovered = save_manager.discover_save_folders()
+                    if len(discovered) == 1:
+                        save_dir = discovered[0]
+                        save_settings["save_dir"] = str(save_dir)
+                        save_manager.save_settings(DATA_DIR, save_settings)
+                    else:
+                        raise ValueError(
+                            "Set your Sekiro save folder in Save Manager before using Run Modded."
+                        )
+                else:
+                    save_dir = Path(save_dir_value).expanduser()
+                save_dir = save_manager.validate_save_dir(save_dir)
+                if save_manager.is_game_running():
+                    raise ValueError("Close Sekiro before creating an automatic save backup.")
                 with contextlib.redirect_stdout(io.StringIO()):
+                    backup_path = save_manager.create_backup(
+                        save_dir,
+                        DATA_DIR,
+                        keep_backups=save_settings["keep_backups"],
+                        label="Automatic backup before Run Modded",
+                        profile=save_settings["active_profile"],
+                    )
                     if nested_path is not None and is_nested_mod_folder(nested_path):
                         enabled_count = install_external_mod(game_dir, nested_name)
                     else:
                         enabled_count = launch_modded_game(game_dir)
                 self.refresh()
                 self.status.set(
-                    f"Sekiro launched  ·  {enabled_count} manager mod(s) enabled"
+                    f"Backup: {backup_path.name}  ·  Sekiro launched  ·  "
+                    f"{enabled_count} manager mod(s) enabled"
                 )
             except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
                 self.refresh()
                 messagebox.showerror("Could not launch Sekiro", str(error), parent=self.root)
+
+        def open_save_manager(self) -> None:
+            self.show_workspace_page("saves")
+
+        def build_save_manager_tab(self) -> None:
+            try:
+                settings = save_manager.load_settings(DATA_DIR)
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Could not load save settings", str(error), parent=self.root)
+                return
+            dialog = self.save_manager_tab
+            body = ttk.Frame(dialog, padding=8)
+            body.pack(fill="both", expand=True)
+            ttk.Label(body, text="SAVE MANAGER", style="Eyebrow.TLabel").pack(anchor="w")
+            ttk.Label(
+                body,
+                text="Back up, restore, or switch between separate Sekiro saves.",
+                style="Muted.TLabel",
+            ).pack(anchor="w", pady=(4, 12))
+            save_dir_var = tk.StringVar(value=settings["save_dir"] or "")
+            retention_var = tk.StringVar(value=str(settings["keep_backups"]))
+            save_location_var = tk.StringVar()
+            current_save_details_var = tk.StringVar(value="Current save details: not loaded")
+
+            def update_save_location(*_args: object) -> None:
+                del _args
+                location = save_dir_var.get().strip()
+                save_location_var.set(
+                    f"Save folder: {location}" if location
+                    else "Save folder not set. Choose Settings to find it."
+                )
+                current_save_details_var.set(
+                    "Save details will refresh after you save the selected folder."
+                )
+
+            save_dir_var.trace_add("write", update_save_location)
+            update_save_location()
+
+            notebook = ttk.Notebook(body)
+            notebook.pack(fill="both", expand=True)
+            backups_tab = ttk.Frame(notebook, padding=14)
+            profiles_tab = ttk.Frame(notebook, padding=14)
+            settings_tab = ttk.Frame(notebook, padding=14)
+            notebook.add(backups_tab, text="Backups")
+            notebook.add(profiles_tab, text="Save profiles")
+            notebook.add(settings_tab, text="Settings")
+
+            ttk.Label(backups_tab, textvariable=save_location_var, style="Muted.TLabel").pack(
+                anchor="w", pady=(0, 8),
+            )
+            ttk.Label(
+                backups_tab,
+                textvariable=current_save_details_var,
+                style="Muted.TLabel",
+                wraplength=680,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 8))
+            ttk.Label(
+                backups_tab,
+                text="A backup copies the entire save folder. Run Modded also creates one automatically.",
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w", pady=(0, 12))
+            label_row = ttk.Frame(backups_tab)
+            label_row.pack(fill="x", pady=(0, 10))
+            ttk.Label(label_row, text="Backup note (optional):").pack(side="left")
+            label_var = tk.StringVar()
+            ttk.Entry(label_row, textvariable=label_var).pack(
+                side="left", fill="x", expand=True, padx=(8, 0),
+            )
+
+            backup_list_frame = ttk.Frame(backups_tab)
+            backup_list_frame.pack(fill="both", expand=True)
+            backup_list = ttk.Treeview(
+                backup_list_frame,
+                columns=("date", "label", "profile"),
+                show="headings",
+                selectmode="browse",
+                height=10,
+            )
+            backup_list.heading("date", text="Date")
+            backup_list.heading("label", text="Note")
+            backup_list.heading("profile", text="Profile")
+            backup_list.column("date", width=190, anchor="w")
+            backup_list.column("label", width=280, anchor="w")
+            backup_list.column("profile", width=150, anchor="w")
+            backup_scrollbar = ttk.Scrollbar(
+                backup_list_frame,
+                orient="vertical",
+                command=backup_list.yview,
+            )
+            backup_list.configure(yscrollcommand=backup_scrollbar.set)
+            backup_list.pack(side="left", fill="both", expand=True)
+            backup_scrollbar.pack(side="right", fill="y")
+            backup_paths: Dict[str, Path] = {}
+            backup_details_var = tk.StringVar(value="Select a backup to inspect its Sekiro save.")
+            ttk.Label(
+                backups_tab,
+                textvariable=backup_details_var,
+                style="Muted.TLabel",
+                wraplength=680,
+                justify="left",
+            ).pack(anchor="w", pady=(8, 0))
+            backup_count_var = tk.StringVar()
+            ttk.Label(backups_tab, textvariable=backup_count_var, style="Muted.TLabel").pack(
+                anchor="w", pady=(8, 0),
+            )
+
+            def browse_save_dir() -> None:
+                selected = filedialog.askdirectory(
+                    title="Select the folder containing Sekiro's save files",
+                    initialdir=save_dir_var.get() or str(save_manager.default_appdata() / "Sekiro"),
+                    parent=dialog,
+                )
+                if selected:
+                    save_dir_var.set(selected)
+
+            def detect_save_dir() -> None:
+                candidates = save_manager.discover_save_folders()
+                if len(candidates) == 1:
+                    save_dir_var.set(str(candidates[0]))
+                elif candidates:
+                    messagebox.showinfo(
+                        "Multiple save folders found",
+                        "Choose the correct Steam account save folder:\n\n"
+                        + "\n".join(str(path) for path in candidates),
+                        parent=dialog,
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Save folder not found",
+                        "No %APPDATA%\\Sekiro\\<numeric ID>\\S0000.sl2 folder was found. "
+                        "Use Browse to select the save folder yourself.",
+                        parent=dialog,
+                    )
+
+            def get_save_settings() -> save_manager.SaveSettings:
+                entered = save_dir_var.get().strip().strip('"')
+                save_dir = Path(entered).expanduser().resolve() if entered else None
+                if save_dir is None:
+                    raise ValueError("Choose your Sekiro save folder in Settings first.")
+                save_dir = save_manager.validate_save_dir(save_dir)
+                try:
+                    keep_backups = int(retention_var.get())
+                except ValueError as error:
+                    raise ValueError("Keep-backup count must be a whole number from 1 to 100.") from error
+                if not save_manager.BACKUP_RETENTION_MIN <= keep_backups <= save_manager.BACKUP_RETENTION_MAX:
+                    raise ValueError("Keep-backup count must be between 1 and 100.")
+                current = save_manager.load_settings(DATA_DIR)
+                current["save_dir"] = str(save_dir) if save_dir is not None else None
+                current["keep_backups"] = keep_backups
+                save_manager.save_settings(DATA_DIR, current)
+                return current
+
+            def save_folder_and_settings() -> Optional[save_manager.SaveSettings]:
+                try:
+                    result = get_save_settings()
+                    self.status.set(f"Save folder saved: {result['save_dir']}")
+                    update_current_save_details()
+                    return result
+                except (OSError, ValueError) as error:
+                    messagebox.showerror("Could not save settings", str(error), parent=dialog)
+                    return None
+
+            def update_current_save_details() -> None:
+                entered = save_dir_var.get().strip().strip('"')
+                if not entered:
+                    current_save_details_var.set(
+                        "Current save details: choose a save folder in Settings."
+                    )
+                    return
+                save_file = Path(entered).expanduser() / "S0000.sl2"
+                try:
+                    details = save_manager.format_sekiro_save_summary(save_file)
+                except (OSError, ValueError) as error:
+                    details = f"Save details unavailable: {error}"
+                current_save_details_var.set(f"Current save:\n{details}")
+
+            def update_backup_details(_event: object = None) -> None:
+                del _event
+                selection = backup_list.selection()
+                backup_path = backup_paths.get(selection[0]) if selection else None
+                if backup_path is None:
+                    backup_details_var.set("Select a backup to inspect its Sekiro save.")
+                    return
+                try:
+                    details = save_manager.format_sekiro_save_summary(
+                        backup_path / "save" / "S0000.sl2"
+                    )
+                except (OSError, ValueError) as error:
+                    details = f"Save details unavailable: {error}"
+                backup_details_var.set(f"Selected backup:\n{details}")
+
+            backup_list.bind("<<TreeviewSelect>>", update_backup_details)
+
+            def refresh_backups() -> None:
+                try:
+                    backup_paths.clear()
+                    for item in backup_list.get_children():
+                        backup_list.delete(item)
+                    backups = save_manager.list_backups(DATA_DIR)
+                    for backup in backups:
+                        backup_path = Path(str(backup["path"]))
+                        created_at = str(backup["created_at"]).replace("T", " ").split(".")[0]
+                        backup_paths[backup_path.name] = backup_path
+                        backup_list.insert(
+                            "",
+                            "end",
+                            iid=backup_path.name,
+                            values=(
+                                created_at,
+                                backup["label"] or "—",
+                                backup["profile"] or "—",
+                            ),
+                        )
+                    backup_count_var.set(
+                        f"{len(backups)} backup(s) · keeps newest {retention_var.get()}"
+                    )
+                    children = backup_list.get_children()
+                    if children:
+                        backup_list.selection_set(children[0])
+                    update_backup_details()
+                except (OSError, ValueError) as error:
+                    messagebox.showerror("Could not read backups", str(error), parent=dialog)
+
+            update_current_save_details()
+
+            def backup_now() -> None:
+                try:
+                    current = save_folder_and_settings()
+                    if current is None or not current["save_dir"]:
+                        return
+                    if save_manager.is_game_running():
+                        raise ValueError("Close Sekiro before creating a save backup.")
+                    backup = save_manager.create_backup(
+                        Path(current["save_dir"]),
+                        DATA_DIR,
+                        keep_backups=current["keep_backups"],
+                        label=label_var.get(),
+                        profile=current["active_profile"],
+                    )
+                    label_var.set("")
+                    refresh_backups()
+                    self.status.set(f"Save backup created: {backup.name}")
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Backup failed", str(error), parent=dialog)
+
+            backup_actions = ttk.Frame(backups_tab)
+            backup_actions.pack(fill="x", pady=(12, 0))
+            ttk.Button(
+                backup_actions,
+                text="Backup now",
+                command=backup_now,
+                style="Accent.TButton",
+            ).pack(side="left")
+            ttk.Button(
+                backup_actions,
+                text="Refresh",
+                command=refresh_backups,
+            ).pack(side="left", padx=(8, 0))
+
+            def restore_selected() -> None:
+                selection = backup_list.selection()
+                backup = backup_paths.get(selection[0]) if selection else None
+                if backup is None:
+                    messagebox.showinfo("Select a backup", "Choose a backup to restore.", parent=dialog)
+                    return
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                backup_values = backup_list.item(selection[0], "values")
+                description = " · ".join(str(value) for value in backup_values if value != "—")
+                if not messagebox.askyesno(
+                    "Restore save backup",
+                    f"Restore this backup?\n\n{description}\n\n"
+                    "The entire current save folder will be replaced. The current save "
+                    "will first be copied into a new backup so you can undo this restore.\n\n"
+                    + save_manager.game_cloud_warning()
+                    + "\n\nContinue?",
+                    parent=dialog,
+                ):
+                    return
+                try:
+                    save_manager.restore_backup(
+                        backup,
+                        Path(current["save_dir"]),
+                        DATA_DIR,
+                    )
+                    refresh_backups()
+                    update_current_save_details()
+                    self.status.set(f"Save restored from: {backup.name}")
+                    messagebox.showinfo("Save restored", "The save folder was restored and verified.", parent=dialog)
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Restore failed", str(error), parent=dialog)
+
+            ttk.Button(
+                backup_actions,
+                text="Restore selected...",
+                command=restore_selected,
+            ).pack(side="right")
+            refresh_backups()
+
+            ttk.Label(
+                profiles_tab,
+                text="Each profile stores a separate copy of your complete save folder. Switching saves "
+                "the current profile first, then loads the selected profile.",
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w", pady=(0, 14))
+            active_profile_var = tk.StringVar()
+            ttk.Label(
+                profiles_tab,
+                textvariable=active_profile_var,
+                style="Muted.TLabel",
+            ).pack(anchor="w", pady=(0, 8))
+            profile_row = ttk.Frame(profiles_tab)
+            profile_row.pack(fill="x", pady=(0, 12))
+            profile_list = ttk.Combobox(profile_row, state="readonly")
+            profile_list.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            profile_details_var = tk.StringVar(
+                value="Select a profile to inspect its Sekiro save."
+            )
+            ttk.Label(
+                profiles_tab,
+                textvariable=profile_details_var,
+                style="Muted.TLabel",
+                wraplength=680,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 12))
+
+            def update_profile_details(_event: object = None) -> None:
+                del _event
+                name = profile_list.get()
+                if not name:
+                    profile_details_var.set("Select a profile to inspect its Sekiro save.")
+                    return
+                save_file = save_manager.profile_root(DATA_DIR) / name / "save" / "S0000.sl2"
+                try:
+                    details = save_manager.format_sekiro_save_summary(save_file)
+                except (OSError, ValueError) as error:
+                    details = f"Save details unavailable: {error}"
+                profile_details_var.set(f"Profile '{name}':\n{details}")
+
+            profile_list.bind("<<ComboboxSelected>>", update_profile_details)
+
+            def refresh_profiles() -> None:
+                profiles = save_manager.list_profiles(DATA_DIR)
+                profile_list.configure(values=profiles)
+                profile_settings = save_manager.load_settings(DATA_DIR)
+                active = profile_settings["active_profile"]
+                profile_list.set(active if active in profiles else (profiles[0] if profiles else ""))
+                active_profile_var.set(
+                    f"Active save: {active}" if active
+                    else "Active save: No profile (your regular Sekiro save)"
+                )
+                update_profile_details()
+
+            def create_profile() -> None:
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                name = simpledialog.askstring(
+                    "Create save profile",
+                    "Name this profile (for example, Randomizer):",
+                    parent=dialog,
+                )
+                if name is None:
+                    return
+                try:
+                    profile = save_manager.create_profile(
+                        Path(current["save_dir"]),
+                        DATA_DIR,
+                        name,
+                    )
+                    refresh_profiles()
+                    self.status.set(f"Save profile created: {profile}")
+                    messagebox.showinfo(
+                        "Profile created",
+                        f"'{profile}' is an independent copy of the current save. "
+                        "The current game save was not changed.",
+                        parent=dialog,
+                    )
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Could not create profile", str(error), parent=dialog)
+
+            def switch_profile() -> None:
+                name = profile_list.get()
+                if not name:
+                    messagebox.showinfo("Select a profile", "Create or select a save profile.", parent=dialog)
+                    return
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                active = current["active_profile"] or "unprofiled save"
+                if not messagebox.askyesno(
+                    "Switch save profile",
+                    f"Switch from '{active}' to '{name}'?\n\n"
+                    "The current save will be backed up and saved to its active profile "
+                    "before the selected profile is copied into the game save folder. "
+                    "Close Sekiro before switching.",
+                    parent=dialog,
+                ):
+                    return
+                try:
+                    profile = save_manager.switch_profile(
+                        Path(current["save_dir"]),
+                        DATA_DIR,
+                        name,
+                    )
+                    refresh_profiles()
+                    update_current_save_details()
+                    refresh_backups()
+                    self.status.set(f"Active save profile: {profile}")
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Could not switch profile", str(error), parent=dialog)
+
+            ttk.Button(
+                profiles_tab,
+                text="Create profile from current save...",
+                command=create_profile,
+                style="Accent.TButton",
+            ).pack(anchor="w", pady=(0, 8))
+            ttk.Button(
+                profiles_tab,
+                text="Switch to selected profile...",
+                command=switch_profile,
+            ).pack(anchor="w")
+            ttk.Label(
+                profiles_tab,
+                text="Close Sekiro before creating or switching profiles.",
+                style="Muted.TLabel",
+            ).pack(anchor="w", pady=(16, 0))
+            refresh_profiles()
+
+            ttk.Label(
+                settings_tab,
+                text="Select the folder that contains S0000.sl2. It is usually "
+                "%APPDATA%\\Sekiro\\<Steam ID>.",
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w", pady=(0, 10))
+            save_dir_row = ttk.Frame(settings_tab)
+            save_dir_row.pack(fill="x")
+            ttk.Entry(save_dir_row, textvariable=save_dir_var).pack(
+                side="left", fill="x", expand=True, padx=(0, 8),
+            )
+            ttk.Button(save_dir_row, text="Detect", command=detect_save_dir).pack(side="left")
+            ttk.Button(save_dir_row, text="Browse...", command=browse_save_dir).pack(
+                side="left", padx=(6, 0),
+            )
+
+            ttk.Label(
+                settings_tab,
+                text="Keep newest backups:",
+            ).pack(anchor="w", pady=(18, 6))
+            retention_row = ttk.Frame(settings_tab)
+            retention_row.pack(anchor="w")
+            ttk.Spinbox(
+                retention_row,
+                from_=save_manager.BACKUP_RETENTION_MIN,
+                to=save_manager.BACKUP_RETENTION_MAX,
+                textvariable=retention_var,
+                width=6,
+            ).pack(side="left")
+            ttk.Label(retention_row, text="(1–100)").pack(side="left", padx=(8, 0))
+            ttk.Button(
+                settings_tab,
+                text="Save settings",
+                command=save_folder_and_settings,
+                style="Accent.TButton",
+            ).pack(anchor="w", pady=(14, 20))
+            ttk.Label(
+                settings_tab,
+                text=save_manager.game_cloud_warning(),
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w")
+            def refresh_save_manager_page() -> None:
+                update_current_save_details()
+                refresh_backups()
+                refresh_profiles()
+
+            self.refresh_save_manager = refresh_save_manager_page
+            self.save_manager_built = True
 
         def rename_installed_mod(self) -> None:
             selected = self.selected_mod()
@@ -1392,9 +2376,31 @@ def launch_gui() -> None:
             name = item[0]
             if not self.ensure_game_dir():
                 return
+            conflicts = find_mod_conflicts(name)
+            allow_conflicts = False
+            if conflicts:
+                details = "\n".join(
+                    f"• {relative}  (currently provided by {', '.join(owners)})"
+                    for relative, owners in conflicts[:20]
+                )
+                if len(conflicts) > 20:
+                    details += f"\n…and {len(conflicts) - 20} more conflicting file(s)."
+                allow_conflicts = messagebox.askyesno(
+                    "Same-file mod conflicts",
+                    f"{name} shares {len(conflicts)} file(s) with enabled mods:\n\n"
+                    f"{details}\n\n"
+                    "If you continue, this mod's version will take priority for those "
+                    "paths. Other files from both mods remain enabled; disabling this "
+                    "mod restores the previous enabled version. This replaces files, "
+                    "it does not merge them, and overhaul mods may still be incompatible.\n\n"
+                    "Enable anyway?",
+                    parent=self.root,
+                )
+                if not allow_conflicts:
+                    return
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    globals()["enable_mod"](name)
+                    globals()["enable_mod"](name, allow_conflicts=allow_conflicts)
                 self.refresh()
                 self.status.set(f"Enabled: {name}")
             except (OSError, ValueError, shutil.Error) as error:

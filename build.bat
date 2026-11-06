@@ -36,10 +36,12 @@ set "PYINSTALLER_SPEC=%BUILD_ROOT%\pyinstaller-spec"
 set "PACKAGE_SOURCE=%PYINSTALLER_DIST%\Healing Gourd Mod Manager"
 set "APP_OUTPUT=%~dp0dist\Healing Gourd Mod Manager"
 set "RELEASE_DIR=%~dp0release"
-set "RELEASE_ZIP=%RELEASE_DIR%\Healing Gourd Mod Manager Portable.zip"
-set "RELEASE_TEMP=%RELEASE_DIR%\Healing Gourd Mod Manager Portable.tmp.zip"
+set "RELEASE_ZIP=%RELEASE_DIR%\Healing Gourd Mod Manager.zip"
+set "RELEASE_TEMP=%RELEASE_DIR%\Healing Gourd Mod Manager.tmp.zip"
 set "ICON=%~dp0Assets\healing-gourd.ico"
 set "BACKGROUND=%~dp0Assets\sekiro-background.png"
+set "SEVEN_ZIP=%~dp0Assets\7za.exe"
+set "SEVEN_ZIP_LICENSE=%~dp0Assets\7zip-license.txt"
 
 if not exist "%ICON%" (
     echo Could not find the default app icon: "%ICON%"
@@ -48,6 +50,16 @@ if not exist "%ICON%" (
 )
 if not exist "%BACKGROUND%" (
     echo Could not find the default background image: "%BACKGROUND%"
+    popd
+    exit /b 1
+)
+if not exist "%SEVEN_ZIP%" (
+    echo Could not find the bundled 7-Zip helper: "%SEVEN_ZIP%"
+    popd
+    exit /b 1
+)
+if not exist "%SEVEN_ZIP_LICENSE%" (
+    echo Could not find the 7-Zip license: "%SEVEN_ZIP_LICENSE%"
     popd
     exit /b 1
 )
@@ -69,6 +81,8 @@ if errorlevel 1 (
     --add-data "%~dp0Assets\healing-gourd.ico;Assets" ^
     --add-data "%~dp0Assets\healing-gourd.png;Assets" ^
     --add-data "%BACKGROUND%;Assets" ^
+    --add-data "%SEVEN_ZIP%;Assets" ^
+    --add-data "%SEVEN_ZIP_LICENSE%;Assets" ^
     --name "Healing Gourd Mod Manager" ^
     --distpath "%PYINSTALLER_DIST%" ^
     --workpath "%PYINSTALLER_WORK%" ^
@@ -138,5 +152,5 @@ if errorlevel 1 (
 )
 
 echo Built local app: dist\Healing Gourd Mod Manager\Healing Gourd Mod Manager.exe
-echo Built portable package: release\Healing Gourd Mod Manager Portable.zip
+echo Built portable package: release\Healing Gourd Mod Manager.zip
 popd

@@ -1,4 +1,5 @@
 import tempfile
+import subprocess
 import unittest
 import zipfile
 from pathlib import Path
@@ -27,6 +28,22 @@ class ModImportTests(unittest.TestCase):
                 archive.writestr(entry_name, content)
         return archive_path
 
+    def make_7z_archive(self, name: str, files: dict[str, bytes]) -> Path:
+        source = self.root / f"{Path(name).stem}-source"
+        for relative, content in files.items():
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        archive = self.root / name
+        helper = main.bundled_asset_path("7za.exe")
+        subprocess.run(
+            [str(helper), "a", "-t7z", str(archive), *files],
+            cwd=source,
+            check=True,
+            capture_output=True,
+        )
+        return archive
+
     def test_imports_zip_and_removes_matching_wrapper_folder(self) -> None:
         archive = self.make_archive(
             "Test Mod.zip",
@@ -53,6 +70,40 @@ class ModImportTests(unittest.TestCase):
 
         self.assertEqual(imported_name, "Phantom Blade Zero")
         self.assertTrue((self.library / imported_name / "parts/chr/model.bin").is_file())
+
+    def test_imports_7z_and_uses_its_enclosing_folder_as_the_mod_name(self) -> None:
+        archive = self.make_7z_archive(
+            "download.7z",
+            {"Phantom Blade Zero/parts/chr/model.bin": b"model"},
+        )
+
+        imported_name = main.import_mod(str(archive))
+
+        self.assertEqual(imported_name, "Phantom Blade Zero")
+        self.assertEqual(
+            (self.library / imported_name / "parts/chr/model.bin").read_bytes(),
+            b"model",
+        )
+
+    def test_7z_import_keeps_root_game_content_folder(self) -> None:
+        archive = self.make_7z_archive(
+            "parts-mod.7z",
+            {"parts/chr/model.bin": b"model"},
+        )
+
+        imported_name = main.import_mod(str(archive))
+
+        self.assertEqual(imported_name, "parts-mod")
+        self.assertEqual(
+            (self.library / imported_name / "parts/chr/model.bin").read_bytes(),
+            b"model",
+        )
+
+    def test_7z_archive_path_validation_rejects_traversal_and_reserved_names(self) -> None:
+        for path in ("../outside.txt", "C:/outside.txt", "parts/CON.txt"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "Unsafe path"):
+                    main._validate_archive_member_path(path, "7z")
 
     def test_import_preserves_game_mod_folder_layout(self) -> None:
         archive = self.make_archive("Another Mod.zip", {"parts/chr/test-part.bin": b"part"})
@@ -139,6 +190,126 @@ class LaunchGameTests(unittest.TestCase):
         self.assertEqual(enabled_count, 1)
         enable_mod.assert_not_called()
         launch_game.assert_called_once_with(game_dir)
+
+    def test_conflicting_enabled_mods_stack_and_restore_previous_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game_dir = root / "Sekiro"
+            library = root / "Library"
+            first_mod = library / "Overhaul A"
+            second_mod = library / "Overhaul B"
+            relative = Path("parts") / "chr" / "shared.bin"
+            for folder in (first_mod, second_mod):
+                (folder / relative).parent.mkdir(parents=True)
+            (first_mod / relative).write_bytes(b"first")
+            (second_mod / relative).write_bytes(b"second")
+            first_only = first_mod / "parts" / "chr" / "first-only.bin"
+            second_only = second_mod / "parts" / "chr" / "second-only.bin"
+            first_only.write_bytes(b"first only")
+            second_only.write_bytes(b"second only")
+            state = {
+                "version": 1,
+                "game_dir": str(game_dir),
+                "mods": {},
+                "display_names": {},
+                "appearance": {"background_image": None, "app_icon": None},
+            }
+            destination = game_dir / "mods" / relative
+
+            with (
+                mock.patch.object(main, "LIBRARY", library),
+                mock.patch.object(main, "load_state", side_effect=lambda: state),
+                mock.patch.object(main, "save_state"),
+                mock.patch.object(main, "get_game_dir", return_value=game_dir),
+            ):
+                main.enable_mod("Overhaul A")
+
+                self.assertEqual(
+                    main.find_mod_conflicts("Overhaul B", state),
+                    [("parts/chr/shared.bin", ["Overhaul A"])],
+                )
+                with self.assertRaisesRegex(ValueError, "Mod file conflicts detected"):
+                    main.enable_mod("Overhaul B")
+                self.assertEqual(destination.read_bytes(), b"first")
+                self.assertNotIn("Overhaul B", state["mods"])
+
+                main.enable_mod("Overhaul B", allow_conflicts=True)
+                self.assertEqual(destination.read_bytes(), b"second")
+                self.assertTrue((game_dir / "mods" / second_only.relative_to(second_mod)).is_file())
+                main.disable_mod("Overhaul B")
+                self.assertEqual(destination.read_bytes(), b"first")
+                self.assertFalse((game_dir / "mods" / second_only.relative_to(second_mod)).exists())
+                self.assertTrue((game_dir / "mods" / first_only.relative_to(first_mod)).is_file())
+                self.assertIn("Overhaul A", state["mods"])
+
+                main.enable_mod("Overhaul B", allow_conflicts=True)
+                main.disable_mod("Overhaul A")
+                self.assertEqual(destination.read_bytes(), b"second")
+                self.assertIn("Overhaul B", state["mods"])
+                main.disable_mod("Overhaul B")
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(state["mods"], {})
+
+    def test_enable_never_overwrites_an_unmanaged_game_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game_dir = root / "Sekiro"
+            library = root / "Library"
+            mod = library / "Overhaul"
+            relative = Path("parts") / "chr" / "existing.bin"
+            (mod / relative).parent.mkdir(parents=True)
+            (mod / relative).write_bytes(b"mod")
+            destination = game_dir / "mods" / relative
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"external")
+            state = {
+                "version": 1,
+                "game_dir": str(game_dir),
+                "mods": {},
+                "display_names": {},
+                "appearance": {"background_image": None, "app_icon": None},
+            }
+
+            with (
+                mock.patch.object(main, "LIBRARY", library),
+                mock.patch.object(main, "load_state", return_value=state),
+                mock.patch.object(main, "get_game_dir", return_value=game_dir),
+            ):
+                with self.assertRaisesRegex(ValueError, "Deployment conflict"):
+                    main.enable_mod("Overhaul", allow_conflicts=True)
+
+            self.assertEqual(destination.read_bytes(), b"external")
+            self.assertEqual(state["mods"], {})
+
+    def test_enable_rolls_back_files_and_state_when_saving_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game_dir = root / "Sekiro"
+            library = root / "Library"
+            mod = library / "Test Mod"
+            relative = Path("parts") / "chr" / "test.bin"
+            (mod / relative).parent.mkdir(parents=True)
+            (mod / relative).write_bytes(b"mod")
+            state = {
+                "version": 1,
+                "game_dir": str(game_dir),
+                "mods": {},
+                "display_names": {},
+                "appearance": {"background_image": None, "app_icon": None},
+            }
+
+            with (
+                mock.patch.object(main, "LIBRARY", library),
+                mock.patch.object(main, "load_state", return_value=state),
+                mock.patch.object(main, "save_state", side_effect=OSError("disk full")),
+                mock.patch.object(main, "get_game_dir", return_value=game_dir),
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    main.enable_mod("Test Mod")
+
+            self.assertFalse((game_dir / "mods" / relative).exists())
+            self.assertEqual(state["mods"], {})
 
     def test_rejects_invalid_game_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
