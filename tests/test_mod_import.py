@@ -44,6 +44,12 @@ class ModImportTests(unittest.TestCase):
         )
         return archive
 
+    def test_support_link_opens_the_configured_kofi_page(self) -> None:
+        with mock.patch.object(main.webbrowser, "open_new_tab", return_value=True) as open_page:
+            self.assertTrue(main.open_support_page())
+
+        open_page.assert_called_once_with("https://ko-fi.com/dkhang2")
+
     def test_imports_zip_and_removes_matching_wrapper_folder(self) -> None:
         archive = self.make_archive(
             "Test Mod.zip",

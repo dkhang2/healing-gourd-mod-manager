@@ -32,7 +32,8 @@ different PNG or GIF; choose **Clear** to restore the default.
 
 The app's left sidebar switches between the **Mod Manager** and **Save
 Manager** workspaces. **Run Modded** and **Customize UI** remain available at
-the bottom of the sidebar.
+the bottom of the sidebar. The **Buy me a coffee :)** button opens
+[Ko-fi](https://ko-fi.com/dkhang2) in your browser.
 
 ## Import and run mods
 

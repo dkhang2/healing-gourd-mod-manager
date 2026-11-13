@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import webbrowser
 import zipfile
 from fractions import Fraction
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -29,6 +30,7 @@ MIGRATION_MARKER = DATA_DIR / ".legacy-migration-complete"
 ASSETS = DATA_DIR / "Assets"
 DEFAULT_ICON_NAME = "healing-gourd.ico"
 DEFAULT_BACKGROUND_NAME = "sekiro-background.png"
+SUPPORT_URL = "https://ko-fi.com/dkhang2"
 MAX_ARCHIVE_FILES = 20000
 MAX_ARCHIVE_SIZE = 2 * 1024 * 1024 * 1024
 MAX_7Z_LISTING_SIZE = 64 * 1024 * 1024
@@ -46,6 +48,10 @@ MOD_CONTENT_DIR_NAMES = {
 def bundled_asset_path(name: str) -> Path:
     bundle_dir = getattr(sys, "_MEIPASS", BASE)
     return Path(bundle_dir) / "Assets" / name
+
+
+def open_support_page() -> bool:
+    return webbrowser.open_new_tab(SUPPORT_URL)
 
 
 def resolve_background_image_path(background: Optional[str]) -> Optional[Path]:
@@ -1166,7 +1172,7 @@ def launch_gui() -> None:
             self.mod_navigation_button.pack(fill="x", pady=(0, 6))
             self.save_navigation_button = ttk.Button(
                 self.sidebar,
-                text="Save Manager\nBackups, profiles & saves",
+                text="Save Manager",
                 command=lambda: self.show_workspace_page("saves"),
                 style="Navigation.TButton",
             )
@@ -1189,6 +1195,18 @@ def launch_gui() -> None:
                 sidebar_actions,
                 text="Customize UI",
                 command=self.customize_ui,
+                style="TButton",
+            ).pack(fill="x")
+            support_box = ttk.LabelFrame(
+                self.sidebar,
+                text="Support",
+                padding=(8, 6),
+            )
+            support_box.pack(side="bottom", fill="x", pady=(0, 12))
+            ttk.Button(
+                support_box,
+                text="Buy me a coffee :)",
+                command=self.open_support_page,
                 style="TButton",
             ).pack(fill="x")
 
@@ -1831,6 +1849,21 @@ def launch_gui() -> None:
 
         def open_save_manager(self) -> None:
             self.show_workspace_page("saves")
+
+        def open_support_page(self) -> None:
+            try:
+                if not open_support_page():
+                    messagebox.showerror(
+                        "Could not open support page",
+                        f"Open this link in your browser:\n{SUPPORT_URL}",
+                        parent=self.root,
+                    )
+            except (OSError, webbrowser.Error) as error:
+                messagebox.showerror(
+                    "Could not open support page",
+                    f"{error}\n\nOpen this link in your browser:\n{SUPPORT_URL}",
+                    parent=self.root,
+                )
 
         def build_save_manager_tab(self) -> None:
             try:
