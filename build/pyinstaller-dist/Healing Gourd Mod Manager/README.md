@@ -76,6 +76,39 @@ the bottom of the sidebar.
   shown as unavailable rather than guessed. The field layout is cross-checked
   against the open-source [sl2-analyzer](https://github.com/darthdemono/sl2-analyzer)
   Sekiro format documentation.
+- **Save slots** shows all 10 slots in the active game save as cards. Existing
+  characters show their journey, playtime, Vitality, and Attack Power, with
+  **Export** and **Remove** actions on that card. Each empty game slot has its
+  own **Import file...** and **Import folder...** actions; importing writes into
+  that game slot, so an imported character appears in Sekiro's roster. A
+  color-coded status and legend show which slots are in use, ready for import,
+  require cleanup, or unavailable.
+  File imports support `.sl2`, ZIP, and 7z; folder imports search recursively
+  and require exactly one `S0000.sl2` file.
+  If the selected save has multiple characters, choose the character in the
+  picker; its save-slot number is separate from the empty game slot you clicked.
+  Import refuses to overwrite a populated or roster-occupied slot, maps the
+  incoming slot to the local account ID, and updates Sekiro's slot roster so the
+  imported character appears in the game's menu. Before importing, the manager
+  verifies the incoming save and backs up the entire current save folder.
+  External saves only need valid character data in the selected source slot;
+  the app sets the active roster flag in your game save during import.
+  Exports remove the source account ID. Close Sekiro before importing or
+  removing a slot. Share exported files through this manager instead of
+  replacing `S0000.sl2` directly.
+- **Export full save folder (.zip)...** creates a verified ZIP containing the
+  complete configured save folder, including `S0000.sl2` and
+  `S0000.sl2.bak` when present. The ZIP can be selected from any empty card's
+  **Import file...** action; choose which populated source slot to merge.
+  7z archives are safely extracted before import. A full-folder archive may contain
+  other characters and account-specific save data; use single-slot export when
+  you only intend to share one character.
+- **Remove...** on a populated or stale-entry card clears that game slot after
+  confirmation. The manager refuses while Sekiro is running and
+  creates a verified backup of the entire save folder first. Restore that
+  backup from the Backups tab to undo the removal. If Sekiro has a stale roster
+  entry with no character data, it is shown as **Roster entry (clear)** and can
+  be removed here as well.
 - **Run Modded** creates a timestamped, verified backup of the entire selected
   save folder before launching. If the save folder is not configured, Run
   Modded asks you to configure it first.

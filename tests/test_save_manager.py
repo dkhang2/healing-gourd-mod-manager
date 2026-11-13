@@ -4,17 +4,21 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
+import main
 import save_manager
 
 
 def write_test_sekiro_save(
     path: Path,
     populated: dict[int, tuple[int, int, int, int, int]],
+    include_settings: bool = False,
+    settings_steam_id: int = 123456789,
 ) -> None:
-    entry_count = save_manager.SEKIRO_SLOT_COUNT
+    entry_count = save_manager.SEKIRO_SLOT_COUNT + int(include_settings)
     table_end = save_manager.SEKIRO_BND4_HEADER_SIZE + (
         save_manager.SEKIRO_BND4_ENTRY_SIZE * entry_count
     )
@@ -24,7 +28,7 @@ def write_test_sekiro_save(
     struct.pack_into("<I", file_data, 12, entry_count)
     next_offset = table_end
 
-    for slot_index in range(entry_count):
+    for slot_index in range(save_manager.SEKIRO_SLOT_COUNT):
         payload = bytearray(payload_size)
         if slot_index in populated:
             steam_id, journey, playtime, vitality, attack_power = populated[slot_index]
@@ -50,6 +54,27 @@ def write_test_sekiro_save(
         struct.pack_into("<I", file_data, entry_header + 16, next_offset)
         file_data.extend(entry)
         next_offset += len(entry)
+
+    if include_settings:
+        settings_payload = bytearray(save_manager.SEKIRO_SETTINGS_PAYLOAD_MIN_SIZE)
+        settings_id_offset = save_manager.SEKIRO_SETTINGS_STEAM_ID_OFFSET
+        settings_payload[settings_id_offset : settings_id_offset + 8] = (
+            settings_steam_id.to_bytes(8, "little")
+        )
+        occupancy_start = save_manager.SEKIRO_SETTINGS_SLOT_OCCUPANCY_OFFSET
+        for slot_index in populated:
+            settings_payload[occupancy_start + slot_index] = 1
+        settings_entry = (
+            hashlib.md5(settings_payload, usedforsecurity=False).digest()
+            + settings_payload
+        )
+        entry_header = (
+            save_manager.SEKIRO_BND4_HEADER_SIZE
+            + save_manager.SEKIRO_BND4_ENTRY_SIZE * save_manager.SEKIRO_SETTINGS_ENTRY_INDEX
+        )
+        struct.pack_into("<Q", file_data, entry_header + 8, len(settings_entry))
+        struct.pack_into("<I", file_data, entry_header + 16, next_offset)
+        file_data.extend(settings_entry)
 
     path.write_bytes(file_data)
 
@@ -143,6 +168,607 @@ class SaveManagerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "No populated Sekiro save slots"):
             save_manager.read_sekiro_slots(save_file)
+        self.assertEqual(
+            save_manager.read_sekiro_slot_table(save_file),
+            [None] * save_manager.SEKIRO_SLOT_COUNT,
+        )
+
+    def test_export_contains_only_selected_slot_and_scrubs_account_id(self) -> None:
+        source = self.root / "source.sl2"
+        destination = self.root / "shareable-slot.sl2"
+        write_test_sekiro_save(
+            source,
+            {
+                1: (987654321, 11, 90000, 20, 99),
+                5: (987654321, 0, 100, 1, 1),
+            },
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        original_source = source.read_bytes()
+
+        save_manager.export_sekiro_slot(source, 2, destination)
+
+        self.assertEqual(source.read_bytes(), original_source)
+        slots = save_manager.read_sekiro_slots(destination)
+        self.assertEqual([slot["slot"] for slot in slots], [2])
+        self.assertEqual(slots[0]["journey"], 11)
+        exported_data = destination.read_bytes()
+        exported_entries, _ = save_manager._parse_sekiro_save_data(exported_data)
+        exported_slot_entry = exported_entries[1]
+        self.assertEqual(
+            int.from_bytes(
+                exported_data[
+                    exported_slot_entry["offset"] + 16 + save_manager.SEKIRO_STEAM_ID_OFFSET :
+                    exported_slot_entry["offset"] + 16 + save_manager.SEKIRO_STEAM_ID_OFFSET + 8
+                ],
+                "little",
+            ),
+            save_manager.SEKIRO_EXPORT_STEAM_ID_PLACEHOLDER,
+        )
+        settings = save_manager._settings_entry(exported_data)
+        settings_payload_start = settings["offset"] + 16
+        self.assertEqual(
+            exported_data[
+                settings_payload_start + save_manager.SEKIRO_SETTINGS_STEAM_ID_OFFSET :
+                settings_payload_start + save_manager.SEKIRO_SETTINGS_STEAM_ID_OFFSET + 8
+            ],
+            bytes(8),
+        )
+        self.assertEqual(
+            save_manager.read_sekiro_slot_occupancy(destination),
+            [False, True] + [False] * (save_manager.SEKIRO_SLOT_COUNT - 2),
+        )
+
+    def test_export_full_save_folder_preserves_all_files_and_imports_zip(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        backup_file = self.save_dir / "S0000.sl2.bak"
+        backup_file.write_bytes(b"original Sekiro backup file")
+        additional_file = self.save_dir / "steam_autocloud.vdf"
+        additional_file.write_bytes(b"cloud metadata")
+
+        export_source = self.root / "source-save-folder"
+        export_source.mkdir()
+        write_test_sekiro_save(
+            export_source / "S0000.sl2",
+            {3: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        (export_source / "S0000.sl2.bak").write_bytes(b"original Sekiro backup file")
+        (export_source / "steam_autocloud.vdf").write_bytes(b"cloud metadata")
+        exported = self.root / "Sekiro-Save-Folder.zip"
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            save_manager.export_sekiro_save_folder(export_source, exported)
+
+        with zipfile.ZipFile(exported) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {"S0000.sl2", "S0000.sl2.bak", "steam_autocloud.vdf"},
+            )
+            self.assertEqual(
+                archive.read("S0000.sl2.bak"),
+                b"original Sekiro backup file",
+            )
+            self.assertEqual(archive.testzip(), None)
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            save_manager.import_sekiro_slot(
+                exported,
+                source_slot_number=4,
+                save_dir=self.save_dir,
+                target_slot_number=8,
+                data_dir=self.data_dir,
+            )
+        imported_slots = save_manager.read_sekiro_slots(save_file)
+        self.assertEqual([slot["slot"] for slot in imported_slots], [1, 8])
+        self.assertEqual(imported_slots[1]["journey"], 11)
+        self.assertEqual(imported_slots[1]["attack_power"], 99)
+        occupancy = save_manager.read_sekiro_slot_occupancy(save_file)
+        self.assertTrue(occupancy[0])
+        self.assertTrue(occupancy[7])
+        self.assertFalse(any(occupancy[1:7]))
+        self.assertFalse(any(occupancy[8:]))
+        self.assertEqual(
+            backup_file.read_bytes(),
+            b"original Sekiro backup file",
+        )
+        self.assertEqual(additional_file.read_bytes(), b"cloud metadata")
+
+    def test_imports_save_from_nested_folder(self) -> None:
+        source_folder = self.root / "exported-save-folder"
+        nested_save = source_folder / "Sekiro" / "123456789" / "S0000.sl2"
+        nested_save.parent.mkdir(parents=True)
+        write_test_sekiro_save(
+            nested_save,
+            {6: (987654321, 3, 14400, 14, 22)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+
+        self.assertEqual(
+            save_manager.read_sekiro_slots(source_folder),
+            [{
+                "slot": 7,
+                "journey": 3,
+                "playtime_seconds": 14400,
+                "vitality": 14,
+                "attack_power": 22,
+            }],
+        )
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            save_manager.import_sekiro_slot(
+                source_folder,
+                source_slot_number=7,
+                save_dir=self.save_dir,
+                target_slot_number=4,
+                data_dir=self.data_dir,
+            )
+
+        imported_slots = save_manager.read_sekiro_slots(self.save_dir / "S0000.sl2")
+        self.assertEqual([slot["slot"] for slot in imported_slots], [1, 4])
+        self.assertEqual(imported_slots[1]["journey"], 3)
+        self.assertEqual(imported_slots[1]["attack_power"], 22)
+
+    def test_folder_import_requires_exactly_one_save_file(self) -> None:
+        source_folder = self.root / "folder-without-a-save"
+        source_folder.mkdir()
+
+        with self.assertRaisesRegex(ValueError, "exactly one S0000.sl2"):
+            save_manager.read_sekiro_slots(source_folder)
+
+    def test_imports_save_from_7z_archive(self) -> None:
+        source_folder = self.root / "7z-save-source"
+        source_folder.mkdir()
+        write_test_sekiro_save(
+            source_folder / "S0000.sl2",
+            {2: (987654321, 5, 18000, 16, 31)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        archive = self.root / "Sekiro-save.7z"
+        subprocess.run(
+            [
+                str(main.bundled_asset_path("7za.exe")),
+                "a",
+                "-t7z",
+                str(archive),
+                "S0000.sl2",
+            ],
+            cwd=source_folder,
+            check=True,
+            capture_output=True,
+        )
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+
+        with tempfile.TemporaryDirectory() as extracted_root:
+            extracted_name = main.extract_7z_archive(
+                archive,
+                Path(extracted_root),
+                mod_name="Sekiro Save Import",
+            )
+            extracted_folder = Path(extracted_root) / extracted_name
+            with mock.patch.object(save_manager, "is_game_running", return_value=False):
+                save_manager.import_sekiro_slot(
+                    extracted_folder,
+                    source_slot_number=3,
+                    save_dir=self.save_dir,
+                    target_slot_number=5,
+                    data_dir=self.data_dir,
+                )
+
+        imported_slots = save_manager.read_sekiro_slots(self.save_dir / "S0000.sl2")
+        self.assertEqual([slot["slot"] for slot in imported_slots], [1, 5])
+        self.assertEqual(imported_slots[1]["journey"], 5)
+        self.assertEqual(imported_slots[1]["attack_power"], 31)
+
+    def test_import_refuses_to_overwrite_an_occupied_target_slot(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {
+                0: (123456789, 0, 100, 2, 4),
+                1: (123456789, 2, 7200, 10, 12),
+            },
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        source = self.root / "source.sl2"
+        write_test_sekiro_save(
+            source,
+            {2: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        original_save = save_file.read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            with self.assertRaisesRegex(ValueError, "already occupied"):
+                save_manager.import_sekiro_slot(
+                    source,
+                    source_slot_number=3,
+                    save_dir=self.save_dir,
+                    target_slot_number=2,
+                    data_dir=self.data_dir,
+                )
+
+        self.assertEqual(save_file.read_bytes(), original_save)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
+
+    def test_import_refuses_roster_occupied_target_with_empty_character_data(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        data = bytearray(save_file.read_bytes())
+        settings = save_manager._settings_entry(data)
+        occupancy_offset = (
+            settings["offset"]
+            + 16
+            + save_manager.SEKIRO_SETTINGS_SLOT_OCCUPANCY_OFFSET
+        )
+        data[occupancy_offset + 2] = 1
+        settings_end = settings["offset"] + settings["size"]
+        data[settings["offset"] : settings["offset"] + 16] = hashlib.md5(
+            data[settings["offset"] + 16 : settings_end],
+            usedforsecurity=False,
+        ).digest()
+        save_file.write_bytes(data)
+        source = self.root / "source.sl2"
+        write_test_sekiro_save(
+            source,
+            {0: (987654321, 1, 200, 3, 5)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        original_save = save_file.read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            with self.assertRaisesRegex(ValueError, "already occupied"):
+                save_manager.import_sekiro_slot(
+                    source,
+                    source_slot_number=1,
+                    save_dir=self.save_dir,
+                    target_slot_number=3,
+                    data_dir=self.data_dir,
+                )
+
+        self.assertEqual(save_file.read_bytes(), original_save)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
+
+    def test_import_merges_selected_slot_remaps_id_and_backs_up_full_folder(self) -> None:
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {
+                0: (123456789, 0, 100, 2, 4),
+                1: (123456789, 1, 7200, 10, 12),
+            },
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        source = self.root / "other-player.sl2"
+        write_test_sekiro_save(
+            source,
+            {4: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        (self.save_dir / "additional-save-data").write_bytes(b"keep this too")
+
+        original_save = (self.save_dir / "S0000.sl2").read_bytes()
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            backup = save_manager.import_sekiro_slot(
+                source,
+                source_slot_number=5,
+                save_dir=self.save_dir,
+                target_slot_number=3,
+                data_dir=self.data_dir,
+            )
+
+        self.assertEqual(
+            (backup / "save" / "S0000.sl2").read_bytes(),
+            original_save,
+        )
+        self.assertEqual(
+            (backup / "save" / "additional-save-data").read_bytes(),
+            b"keep this too",
+        )
+        self.assertEqual(
+            save_manager.read_sekiro_slot_occupancy(self.save_dir / "S0000.sl2"),
+            [True, True, True] + [False] * (save_manager.SEKIRO_SLOT_COUNT - 3),
+        )
+        current_slots = save_manager.read_sekiro_slots(self.save_dir / "S0000.sl2")
+        self.assertEqual([slot["slot"] for slot in current_slots], [1, 2, 3])
+        self.assertEqual(current_slots[0]["attack_power"], 4)
+        self.assertEqual(current_slots[1]["journey"], 1)
+        self.assertEqual(current_slots[2]["journey"], 11)
+        self.assertEqual(current_slots[2]["playtime_seconds"], 90000)
+        self.assertEqual(current_slots[2]["vitality"], 20)
+        self.assertEqual(current_slots[2]["attack_power"], 99)
+        current_data = (self.save_dir / "S0000.sl2").read_bytes()
+        entries, _ = save_manager._parse_sekiro_save_data(current_data)
+        imported_entry = entries[2]
+        imported_steam_id = int.from_bytes(
+            current_data[
+                imported_entry["offset"] + 16 + save_manager.SEKIRO_STEAM_ID_OFFSET :
+                imported_entry["offset"] + 16 + save_manager.SEKIRO_STEAM_ID_OFFSET + 8
+            ],
+            "little",
+        )
+        self.assertEqual(imported_steam_id, 123456789)
+        settings = save_manager._settings_entry(current_data)
+        settings_payload_start = settings["offset"] + 16
+        self.assertEqual(
+            int.from_bytes(
+                current_data[
+                    settings_payload_start + save_manager.SEKIRO_SETTINGS_STEAM_ID_OFFSET :
+                    settings_payload_start + save_manager.SEKIRO_SETTINGS_STEAM_ID_OFFSET + 8
+                ],
+                "little",
+            ),
+            123456789,
+        )
+        backups = save_manager.list_backups(self.data_dir)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0]["label"], "Before importing save slot 3")
+
+    def test_removing_stale_roster_entry_clears_slot_flag(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        data = bytearray(save_file.read_bytes())
+        settings = save_manager._settings_entry(data)
+        occupancy_offset = (
+            settings["offset"]
+            + 16
+            + save_manager.SEKIRO_SETTINGS_SLOT_OCCUPANCY_OFFSET
+        )
+        data[occupancy_offset + 5] = 1
+        settings_end = settings["offset"] + settings["size"]
+        data[settings["offset"] : settings["offset"] + 16] = hashlib.md5(
+            data[settings["offset"] + 16 : settings_end],
+            usedforsecurity=False,
+        ).digest()
+        save_file.write_bytes(data)
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            backup = save_manager.remove_sekiro_slot(self.save_dir, 6, self.data_dir)
+
+        self.assertEqual(
+            save_manager.read_sekiro_slot_occupancy(save_file),
+            [False] * save_manager.SEKIRO_SLOT_COUNT,
+        )
+        self.assertEqual(
+            (backup / "save" / "S0000.sl2").read_bytes(),
+            bytes(data),
+        )
+
+    def test_exported_single_slot_imports_into_a_different_empty_slot(self) -> None:
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        original_save = (self.save_dir / "S0000.sl2").read_bytes()
+        source = self.root / "player-save.sl2"
+        exported = self.root / "Sekiro-Slot-4.sl2"
+        write_test_sekiro_save(
+            source,
+            {3: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        save_manager.export_sekiro_slot(source, 4, exported)
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            save_manager.import_sekiro_slot(
+                exported,
+                source_slot_number=4,
+                save_dir=self.save_dir,
+                target_slot_number=8,
+                data_dir=self.data_dir,
+            )
+
+        slots = save_manager.read_sekiro_slots(self.save_dir / "S0000.sl2")
+        self.assertEqual([slot["slot"] for slot in slots], [1, 8])
+        self.assertEqual(slots[1]["journey"], 11)
+        self.assertEqual(slots[1]["attack_power"], 99)
+        backup = save_manager.list_backups(self.data_dir)[0]
+        self.assertEqual((Path(str(backup["path"])) / "save" / "S0000.sl2").read_bytes(), original_save)
+
+    def test_imports_character_data_when_source_roster_flag_is_not_set(self) -> None:
+        source = self.root / "nexus-save.sl2"
+        write_test_sekiro_save(
+            source,
+            {3: (987654321, 8, 45678, 17, 66)},
+            include_settings=True,
+            settings_steam_id=987654321,
+        )
+        data = bytearray(source.read_bytes())
+        settings = save_manager._settings_entry(data)
+        occupancy_offset = (
+            settings["offset"]
+            + 16
+            + save_manager.SEKIRO_SETTINGS_SLOT_OCCUPANCY_OFFSET
+            + 3
+        )
+        data[occupancy_offset] = 0
+        settings_end = settings["offset"] + settings["size"]
+        data[settings["offset"] : settings["offset"] + 16] = hashlib.md5(
+            data[settings["offset"] + 16 : settings_end],
+            usedforsecurity=False,
+        ).digest()
+        source.write_bytes(data)
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            save_manager.import_sekiro_slot(
+                source,
+                source_slot_number=4,
+                save_dir=self.save_dir,
+                target_slot_number=2,
+                data_dir=self.data_dir,
+            )
+
+        imported = save_manager.read_sekiro_slots(self.save_dir / "S0000.sl2")
+        self.assertEqual([slot["slot"] for slot in imported], [1, 2])
+        self.assertEqual(imported[1]["journey"], 8)
+        self.assertEqual(imported[1]["playtime_seconds"], 45678)
+        self.assertEqual(imported[1]["vitality"], 17)
+        self.assertEqual(imported[1]["attack_power"], 66)
+        occupancy = save_manager.read_sekiro_slot_occupancy(self.save_dir / "S0000.sl2")
+        self.assertTrue(occupancy[1])
+
+    def test_removing_slot_backs_up_full_folder_and_preserves_other_slots(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {
+                0: (123456789, 0, 100, 2, 4),
+                4: (123456789, 3, 8000, 12, 16),
+            },
+            include_settings=True,
+            settings_steam_id=123456789,
+        )
+        original_save = save_file.read_bytes()
+        (self.save_dir / "additional-save-data").write_bytes(b"keep this too")
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            backup = save_manager.remove_sekiro_slot(self.save_dir, 1, self.data_dir)
+
+        slots = save_manager.read_sekiro_slots(save_file)
+        self.assertEqual([slot["slot"] for slot in slots], [5])
+        self.assertEqual(slots[0]["journey"], 3)
+        self.assertEqual((backup / "save" / "S0000.sl2").read_bytes(), original_save)
+        self.assertEqual(
+            (backup / "save" / "additional-save-data").read_bytes(),
+            b"keep this too",
+        )
+        self.assertEqual(
+            save_manager.read_sekiro_slot_table(save_file)[0],
+            None,
+        )
+        backups = save_manager.list_backups(self.data_dir)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0]["label"], "Before removing save slot 1")
+
+    def test_removing_empty_slot_fails_without_backup(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+        )
+        original_save = save_file.read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            with self.assertRaisesRegex(ValueError, "slot 2 is empty"):
+                save_manager.remove_sekiro_slot(self.save_dir, 2, self.data_dir)
+
+        self.assertEqual(save_file.read_bytes(), original_save)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
+
+    def test_removing_slot_refuses_while_game_is_running(self) -> None:
+        save_file = self.save_dir / "S0000.sl2"
+        write_test_sekiro_save(
+            save_file,
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+        )
+        original_save = save_file.read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=True):
+            with self.assertRaisesRegex(ValueError, "Close Sekiro"):
+                save_manager.remove_sekiro_slot(self.save_dir, 1, self.data_dir)
+
+        self.assertEqual(save_file.read_bytes(), original_save)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
+
+    def test_import_refuses_while_game_is_running_without_creating_backup(self) -> None:
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+        )
+        source = self.root / "other-player.sl2"
+        write_test_sekiro_save(
+            source,
+            {1: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+        )
+        original = (self.save_dir / "S0000.sl2").read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=True):
+            with self.assertRaisesRegex(ValueError, "Close Sekiro"):
+                save_manager.import_sekiro_slot(source, 2, self.save_dir, 2, self.data_dir)
+
+        self.assertEqual((self.save_dir / "S0000.sl2").read_bytes(), original)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
+
+    def test_import_rejects_bad_source_checksum_without_backing_up_or_writing(self) -> None:
+        write_test_sekiro_save(
+            self.save_dir / "S0000.sl2",
+            {0: (123456789, 0, 100, 2, 4)},
+            include_settings=True,
+        )
+        source = self.root / "other-player.sl2"
+        write_test_sekiro_save(
+            source,
+            {1: (987654321, 11, 90000, 20, 99)},
+            include_settings=True,
+        )
+        with source.open("r+b") as output:
+            entry_header = (
+                save_manager.SEKIRO_BND4_HEADER_SIZE
+                + save_manager.SEKIRO_BND4_ENTRY_SIZE
+            )
+            output.seek(entry_header + 16)
+            source_entry_offset = int.from_bytes(output.read(4), "little")
+            output.seek(
+                source_entry_offset
+                + 16
+                + save_manager.SEKIRO_ATTACK_POWER_OFFSET
+            )
+            output.write(b"\xff")
+        original = (self.save_dir / "S0000.sl2").read_bytes()
+
+        with mock.patch.object(save_manager, "is_game_running", return_value=False):
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                save_manager.import_sekiro_slot(source, 2, self.save_dir, 2, self.data_dir)
+
+        self.assertEqual((self.save_dir / "S0000.sl2").read_bytes(), original)
+        self.assertEqual(save_manager.list_backups(self.data_dir), [])
 
     def test_backup_copies_and_verifies_entire_save_folder(self) -> None:
         backup = save_manager.create_backup(

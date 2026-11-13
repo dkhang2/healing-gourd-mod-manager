@@ -1065,6 +1065,16 @@ def launch_gui() -> None:
                             font=("Segoe UI", 23, "bold"))
             style.configure("Eyebrow.TLabel", background="#171918", foreground="#bd3b32",
                             font=("Segoe UI", 9, "bold"))
+            style.configure("SlotActive.TLabel", background="#1a1c1b", foreground="#e2b56c",
+                            font=("Segoe UI", 9, "bold"))
+            style.configure("SlotReady.TLabel", background="#1a1c1b", foreground="#79d3a2",
+                            font=("Segoe UI", 9, "bold"))
+            style.configure("SlotUnavailable.TLabel", background="#1a1c1b", foreground="#a79e8e",
+                            font=("Segoe UI", 9, "bold"))
+            style.configure("SlotStale.TLabel", background="#1a1c1b", foreground="#ef8f67",
+                            font=("Segoe UI", 9, "bold"))
+            style.configure("SlotDetail.TLabel", background="#1a1c1b", foreground="#a79e8e",
+                            font=("Segoe UI", 10))
             style.configure("Muted.TLabel", background="#171918", foreground="#a79e8e",
                             font=("Segoe UI", 10))
             style.configure("TLabelframe", background="#1a1c1b", foreground="#d8d0c0",
@@ -1858,12 +1868,146 @@ def launch_gui() -> None:
 
             notebook = ttk.Notebook(body)
             notebook.pack(fill="both", expand=True)
+            slots_tab = ttk.Frame(notebook, padding=14)
             backups_tab = ttk.Frame(notebook, padding=14)
             profiles_tab = ttk.Frame(notebook, padding=14)
             settings_tab = ttk.Frame(notebook, padding=14)
+            notebook.add(slots_tab, text="Save slots")
             notebook.add(backups_tab, text="Backups")
             notebook.add(profiles_tab, text="Save profiles")
             notebook.add(settings_tab, text="Settings")
+
+            ttk.Label(slots_tab, textvariable=save_location_var, style="Muted.TLabel").pack(
+                anchor="w", pady=(0, 8),
+            )
+            ttk.Label(
+                slots_tab,
+                text="These are your game's 10 character slots. Your current saves appear here; "
+                "import into an empty slot or export a character to share it.",
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w", pady=(0, 8))
+            slot_status_var = tk.StringVar(value="Loading game save slots...")
+            ttk.Label(
+                slots_tab,
+                textvariable=slot_status_var,
+                style="Muted.TLabel",
+                wraplength=680,
+            ).pack(anchor="w", pady=(0, 8))
+            slot_legend = ttk.Frame(slots_tab)
+            slot_legend.pack(anchor="w", fill="x", pady=(0, 8))
+            for label, style_name in (
+                ("IN USE · cannot import here", "SlotActive.TLabel"),
+                ("READY · import allowed", "SlotReady.TLabel"),
+                ("CLEANUP · clear before import", "SlotStale.TLabel"),
+                ("UNAVAILABLE · check save folder", "SlotUnavailable.TLabel"),
+            ):
+                ttk.Label(
+                    slot_legend,
+                    text=label,
+                    style=style_name,
+                ).pack(side="left", padx=(0, 18))
+            slot_cards_container = ttk.Frame(slots_tab)
+            slot_cards_container.pack(fill="both", expand=True)
+            slot_cards_canvas = tk.Canvas(
+                slot_cards_container,
+                background="#111211",
+                highlightthickness=0,
+            )
+            slot_cards_scrollbar = ttk.Scrollbar(
+                slot_cards_container,
+                orient="vertical",
+                command=slot_cards_canvas.yview,
+            )
+            slot_cards_canvas.configure(yscrollcommand=slot_cards_scrollbar.set)
+            slot_cards_scrollbar.pack(side="right", fill="y")
+            slot_cards_canvas.pack(side="left", fill="both", expand=True)
+            slot_cards_frame = ttk.Frame(slot_cards_canvas)
+            slot_cards_window = slot_cards_canvas.create_window(
+                (0, 0),
+                window=slot_cards_frame,
+                anchor="nw",
+            )
+
+            def update_slot_cards_scrollregion(_event: object) -> None:
+                del _event
+                slot_cards_canvas.configure(scrollregion=slot_cards_canvas.bbox("all"))
+
+            slot_cards_frame.bind("<Configure>", update_slot_cards_scrollregion)
+            slot_cards_canvas.bind(
+                "<Configure>",
+                lambda event: slot_cards_canvas.itemconfigure(
+                    slot_cards_window,
+                    width=event.width,
+                ),
+            )
+            slot_card_details: Dict[int, tk.StringVar] = {}
+            slot_card_statuses: Dict[int, tk.StringVar] = {}
+            slot_card_status_labels: Dict[int, ttk.Label] = {}
+            slot_card_states: Dict[int, str] = {}
+            slot_card_actions: Dict[int, Dict[str, ttk.Button]] = {}
+            for slot_number in range(1, save_manager.SEKIRO_SLOT_COUNT + 1):
+                slot_cards_frame.columnconfigure(slot_number % 2, weight=1, uniform="slot")
+                card = ttk.LabelFrame(
+                    slot_cards_frame,
+                    text=f"SLOT {slot_number}",
+                    padding=12,
+                )
+                card.grid(
+                    row=(slot_number - 1) // 2,
+                    column=(slot_number - 1) % 2,
+                    sticky="nsew",
+                    padx=6,
+                    pady=6,
+                )
+                status_var = tk.StringVar(value="Loading")
+                status_label = ttk.Label(
+                    card,
+                    textvariable=status_var,
+                    style="SlotUnavailable.TLabel",
+                )
+                status_label.pack(anchor="w")
+                details_var = tk.StringVar(value="Reading Sekiro save...")
+                ttk.Label(
+                    card,
+                    textvariable=details_var,
+                    style="SlotDetail.TLabel",
+                    justify="left",
+                    wraplength=300,
+                ).pack(anchor="w", fill="x", expand=True, pady=(6, 10))
+                actions = ttk.Frame(card)
+                actions.pack(anchor="w", fill="x")
+                slot_card_statuses[slot_number] = status_var
+                slot_card_status_labels[slot_number] = status_label
+                slot_card_details[slot_number] = details_var
+                slot_card_states[slot_number] = "unavailable"
+                slot_card_actions[slot_number] = {
+                    "import_file": ttk.Button(
+                        actions,
+                        text="Import file...",
+                        command=lambda number=slot_number: import_save_slot(number),
+                        style="Accent.TButton",
+                    ),
+                    "import_folder": ttk.Button(
+                        actions,
+                        text="Import folder...",
+                        command=lambda number=slot_number: import_save_folder(number),
+                    ),
+                    "export": ttk.Button(
+                        actions,
+                        text="Export...",
+                        command=lambda number=slot_number: export_slot(number),
+                    ),
+                    "remove": ttk.Button(
+                        actions,
+                        text="Remove...",
+                        command=lambda number=slot_number: remove_slot(number),
+                    ),
+                }
+            slot_cards_frame.rowconfigure("all", weight=1)
+
+            slot_export_actions = ttk.Frame(slots_tab)
+            slot_export_actions.pack(fill="x", pady=(8, 0))
 
             ttk.Label(backups_tab, textvariable=save_location_var, style="Muted.TLabel").pack(
                 anchor="w", pady=(0, 8),
@@ -1977,6 +2121,7 @@ def launch_gui() -> None:
                     result = get_save_settings()
                     self.status.set(f"Save folder saved: {result['save_dir']}")
                     update_current_save_details()
+                    refresh_slot_list(show_errors=False)
                     return result
                 except (OSError, ValueError) as error:
                     messagebox.showerror("Could not save settings", str(error), parent=dialog)
@@ -1995,6 +2140,449 @@ def launch_gui() -> None:
                 except (OSError, ValueError) as error:
                     details = f"Save details unavailable: {error}"
                 current_save_details_var.set(f"Current save:\n{details}")
+
+            def refresh_slot_list(show_errors: bool = True) -> None:
+                entered = save_dir_var.get().strip().strip('"')
+                populated_slots: Dict[int, save_manager.SekiroSaveSlot] = {}
+                occupied_slots: List[bool] = [False] * save_manager.SEKIRO_SLOT_COUNT
+                if entered:
+                    save_file = Path(entered).expanduser() / "S0000.sl2"
+                    try:
+                        slots = save_manager.read_sekiro_slot_table(save_file)
+                        populated_slots = {
+                            slot["slot"]: slot for slot in slots if slot is not None
+                        }
+                        occupied_slots = save_manager.read_sekiro_slot_occupancy(save_file)
+                    except (OSError, ValueError) as error:
+                        for slot_number in range(1, save_manager.SEKIRO_SLOT_COUNT + 1):
+                            slot_card_states[slot_number] = "unavailable"
+                            slot_card_statuses[slot_number].set("SAVE UNAVAILABLE")
+                            slot_card_status_labels[slot_number].configure(
+                                style="SlotUnavailable.TLabel"
+                            )
+                            slot_card_details[slot_number].set(
+                                "Could not read the configured game save."
+                            )
+                            for button in slot_card_actions[slot_number].values():
+                                button.pack_forget()
+                        slot_status_var.set(f"Could not read game save slots: {error}")
+                        if show_errors:
+                            messagebox.showerror("Could not read save slots", str(error), parent=dialog)
+                        return
+                for slot_number in range(1, save_manager.SEKIRO_SLOT_COUNT + 1):
+                    actions = slot_card_actions[slot_number]
+                    for button in actions.values():
+                        button.pack_forget()
+                    if not entered:
+                        slot_card_states[slot_number] = "unavailable"
+                        slot_card_statuses[slot_number].set("SET SAVE FOLDER")
+                        slot_card_status_labels[slot_number].configure(
+                            style="SlotUnavailable.TLabel"
+                        )
+                        slot_card_details[slot_number].set(
+                            "Choose your Sekiro save folder in Settings to view this slot."
+                        )
+                        continue
+                    slot = populated_slots.get(slot_number)
+                    if slot is None:
+                        if occupied_slots[slot_number - 1]:
+                            slot_card_states[slot_number] = "stale"
+                            slot_card_statuses[slot_number].set("ROSTER NEEDS CLEANUP")
+                            slot_card_status_labels[slot_number].configure(
+                                style="SlotStale.TLabel"
+                            )
+                            slot_card_details[slot_number].set(
+                                "Sekiro has a menu entry here, but no character data."
+                            )
+                            actions["remove"].pack(side="left")
+                        else:
+                            slot_card_states[slot_number] = "empty"
+                            slot_card_statuses[slot_number].set("READY TO IMPORT")
+                            slot_card_status_labels[slot_number].configure(
+                                style="SlotReady.TLabel"
+                            )
+                            slot_card_details[slot_number].set(
+                                "Available for an imported character."
+                            )
+                            actions["import_file"].pack(side="left")
+                            actions["import_folder"].pack(side="left", padx=(6, 0))
+                    else:
+                        journey = slot["journey"]
+                        journey_label = (
+                            f"Journey {journey + 1} (NG+{journey})"
+                            if journey
+                            else "Journey 1 (NG)"
+                        )
+                        hours, remainder = divmod(slot["playtime_seconds"], 3600)
+                        slot_card_states[slot_number] = "populated"
+                        slot_card_statuses[slot_number].set("IN USE · IMPORT UNAVAILABLE")
+                        slot_card_status_labels[slot_number].configure(
+                            style="SlotActive.TLabel"
+                        )
+                        slot_card_details[slot_number].set(
+                            f"{journey_label}\n"
+                            f"Play time: {hours}h {remainder // 60:02}m\n"
+                            f"Vitality: {slot['vitality']}  ·  "
+                            f"Attack Power: {slot['attack_power']}"
+                        )
+                        actions["export"].pack(side="left")
+                        actions["remove"].pack(side="left", padx=(6, 0))
+                if entered:
+                    empty_count = sum(
+                        number not in populated_slots and not occupied_slots[number - 1]
+                        for number in range(1, save_manager.SEKIRO_SLOT_COUNT + 1)
+                    )
+                    stale_count = save_manager.SEKIRO_SLOT_COUNT - len(populated_slots) - empty_count
+                    slot_status_var.set(
+                        f"{len(populated_slots)} saves in {save_manager.SEKIRO_SLOT_COUNT} game slots · "
+                        f"{empty_count} open for import"
+                        + (f" · {stale_count} roster entry needs clearing" if stale_count else "")
+                    )
+                else:
+                    slot_status_var.set("Choose your Sekiro save folder in Settings.")
+
+            def export_slot(slot_number: int) -> None:
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                destination = filedialog.asksaveasfilename(
+                    title="Export Sekiro save slot",
+                    initialfile=f"Sekiro-Slot-{slot_number}.sl2",
+                    defaultextension=".sl2",
+                    filetypes=[("Sekiro save", "*.sl2"), ("All files", "*.*")],
+                    parent=dialog,
+                )
+                if not destination:
+                    return
+                try:
+                    save_manager.export_sekiro_slot(
+                        Path(current["save_dir"]) / "S0000.sl2",
+                        slot_number,
+                        Path(destination),
+                    )
+                    self.status.set(f"Exported save slot {slot_number}")
+                    messagebox.showinfo(
+                        "Save slot exported",
+                        f"Slot {slot_number} was exported. Share the .sl2 file; it contains "
+                        "only this selected slot, removes your account ID, and does not change "
+                        "your local save.",
+                        parent=dialog,
+                    )
+                except (OSError, ValueError) as error:
+                    messagebox.showerror("Could not export save slot", str(error), parent=dialog)
+
+            def export_save_folder() -> None:
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                destination = filedialog.asksaveasfilename(
+                    title="Export complete Sekiro save folder",
+                    initialfile="Sekiro-Save-Folder.zip",
+                    defaultextension=".zip",
+                    filetypes=[("ZIP archive", "*.zip")],
+                    parent=dialog,
+                )
+                if not destination:
+                    return
+                try:
+                    save_manager.export_sekiro_save_folder(
+                        Path(current["save_dir"]),
+                        Path(destination),
+                    )
+                    self.status.set("Exported complete Sekiro save folder")
+                    messagebox.showinfo(
+                        "Save folder exported",
+                        "The ZIP contains the complete save folder, including S0000.sl2 "
+                        "and S0000.sl2.bak when present. It was verified and your active "
+                        "save was not changed. It may include other characters and "
+                        "account-specific save data; use Export selected slot if you only "
+                        "intend to share one character.",
+                        parent=dialog,
+                    )
+                except (OSError, ValueError, zipfile.BadZipFile) as error:
+                    messagebox.showerror(
+                        "Could not export save folder",
+                        str(error),
+                        parent=dialog,
+                    )
+
+            def choose_import_character(
+                source_slots: List[save_manager.SekiroSaveSlot],
+                target_slot_number: int,
+            ) -> Optional[int]:
+                picker = tk.Toplevel(dialog)
+                picker.title("Choose a character to import")
+                picker.configure(background="#111211")
+                picker.transient(dialog)
+                picker.resizable(True, False)
+                picker.grab_set()
+                ttk.Label(
+                    picker,
+                    text=f"Choose a character to import into game slot {target_slot_number}.",
+                    style="Title.TLabel",
+                    wraplength=560,
+                    justify="left",
+                ).pack(anchor="w", padx=18, pady=(18, 6))
+                ttk.Label(
+                    picker,
+                    text="These numbers identify characters in the selected save, not your "
+                    "game slots. The selected character will be copied into the empty game slot.",
+                    style="Muted.TLabel",
+                    wraplength=560,
+                    justify="left",
+                ).pack(anchor="w", padx=18, pady=(0, 12))
+
+                columns = ("slot", "journey", "playtime", "vitality", "attack")
+                source_list = ttk.Treeview(
+                    picker,
+                    columns=columns,
+                    show="headings",
+                    selectmode="browse",
+                    height=min(7, len(source_slots)),
+                )
+                for column, heading, width in (
+                    ("slot", "Character in save", 125),
+                    ("journey", "Journey", 155),
+                    ("playtime", "Play time", 100),
+                    ("vitality", "Vitality", 80),
+                    ("attack", "Attack Power", 105),
+                ):
+                    source_list.heading(column, text=heading)
+                    source_list.column(column, width=width, anchor="w")
+                for slot in source_slots:
+                    journey = slot["journey"]
+                    journey_label = (
+                        f"Journey {journey + 1} (NG+{journey})"
+                        if journey
+                        else "Journey 1 (NG)"
+                    )
+                    hours, remainder = divmod(slot["playtime_seconds"], 3600)
+                    source_list.insert(
+                        "",
+                        "end",
+                        iid=str(slot["slot"]),
+                        values=(
+                            slot["slot"],
+                            journey_label,
+                            f"{hours}h {remainder // 60:02}m",
+                            slot["vitality"],
+                            slot["attack_power"],
+                        ),
+                    )
+                source_list.pack(fill="both", expand=True, padx=18)
+                first_slot = source_slots[0]["slot"]
+                source_list.selection_set(str(first_slot))
+                source_list.focus(str(first_slot))
+
+                selected_slot: List[Optional[int]] = [None]
+                buttons = ttk.Frame(picker)
+                buttons.pack(fill="x", padx=18, pady=14)
+
+                def confirm_selection(_event: object = None) -> None:
+                    del _event
+                    selection = source_list.selection()
+                    if selection:
+                        selected_slot[0] = int(selection[0])
+                        picker.destroy()
+
+                ttk.Button(
+                    buttons,
+                    text="Cancel",
+                    command=picker.destroy,
+                ).pack(side="right")
+                ttk.Button(
+                    buttons,
+                    text=f"Import into game slot {target_slot_number}",
+                    command=confirm_selection,
+                    style="Accent.TButton",
+                ).pack(side="right", padx=(0, 8))
+
+                def cancel_picker(_event: object) -> None:
+                    del _event
+                    picker.destroy()
+
+                source_list.bind("<Double-1>", confirm_selection)
+                picker.bind("<Return>", confirm_selection)
+                picker.bind("<Escape>", cancel_picker)
+                picker.update_idletasks()
+                width = max(600, picker.winfo_reqwidth())
+                height = picker.winfo_reqheight()
+                x = dialog.winfo_rootx() + max(0, (dialog.winfo_width() - width) // 2)
+                y = dialog.winfo_rooty() + max(0, (dialog.winfo_height() - height) // 2)
+                picker.geometry(f"{width}x{height}+{x}+{y}")
+                picker.wait_window()
+                return selected_slot[0]
+
+            def import_save_source(source_path: Path, target_slot_number: int) -> None:
+                if slot_card_states.get(target_slot_number) != "empty":
+                    messagebox.showinfo(
+                        "Choose an empty slot",
+                        f"Game slot {target_slot_number} is no longer empty. "
+                        "Refresh the slots and choose an available slot.",
+                        parent=dialog,
+                    )
+                    return
+                try:
+                    available_slots = save_manager.read_sekiro_slots(source_path)
+                except (OSError, ValueError) as error:
+                    messagebox.showerror("Could not read imported save", str(error), parent=dialog)
+                    return
+                available_numbers = [slot["slot"] for slot in available_slots]
+                if len(available_numbers) == 1:
+                    source_slot_number = available_numbers[0]
+                else:
+                    source_slot_number = choose_import_character(
+                        available_slots,
+                        target_slot_number,
+                    )
+                if source_slot_number is None:
+                    return
+                if source_slot_number not in available_numbers:
+                    messagebox.showerror(
+                        "Source slot is empty",
+                        f"Source slot {source_slot_number} is not populated in the selected source. "
+                        f"Choose one of these source slots: "
+                        f"{', '.join(str(number) for number in available_numbers)}. "
+                        f"The destination is local slot {target_slot_number}.",
+                        parent=dialog,
+                    )
+                    return
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                if not messagebox.askyesno(
+                    "Import save slot",
+                    f"Import character from selected save slot {source_slot_number} into "
+                    f"game slot {target_slot_number}?\n\n"
+                    "The selected game slot is currently empty. "
+                    "A verified backup of the "
+                    "entire current save folder will be created first. Other save slots and "
+                    "Sekiro settings will be preserved.\n\n"
+                    + save_manager.game_cloud_warning()
+                    + "\n\nClose Sekiro before continuing.",
+                    parent=dialog,
+                ):
+                    return
+                try:
+                    save_manager.import_sekiro_slot(
+                        source_path,
+                        source_slot_number,
+                        Path(current["save_dir"]),
+                        target_slot_number,
+                        DATA_DIR,
+                    )
+                    refresh_slot_list()
+                    update_current_save_details()
+                    refresh_backups()
+                    refresh_profiles()
+                    self.status.set(f"Imported save into slot {target_slot_number}")
+                    messagebox.showinfo(
+                        "Save slot imported",
+                        f"Source slot {source_slot_number} was imported into local slot "
+                        f"{target_slot_number}. The original save folder is in SaveBackups.",
+                        parent=dialog,
+                    )
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Could not import save slot", str(error), parent=dialog)
+
+            def import_save_slot(target_slot_number: int) -> None:
+                source_path = filedialog.askopenfilename(
+                    title="Choose a Sekiro save file, ZIP, or 7z archive",
+                    filetypes=[
+                        ("Sekiro save or archive", "*.sl2 *.zip *.7z"),
+                        ("Sekiro save", "*.sl2"),
+                        ("ZIP archive", "*.zip"),
+                        ("7-Zip archive", "*.7z"),
+                        ("All files", "*.*"),
+                    ],
+                    parent=dialog,
+                )
+                if not source_path:
+                    return
+                try:
+                    source = Path(source_path)
+                    if source.suffix.casefold() == ".7z":
+                        with tempfile.TemporaryDirectory(prefix="sekiro-save-import-") as temporary:
+                            extracted_name = extract_7z_archive(
+                                source,
+                                Path(temporary),
+                                mod_name="Sekiro Save Import",
+                            )
+                            import_save_source(
+                                Path(temporary) / extracted_name,
+                                target_slot_number,
+                            )
+                    else:
+                        import_save_source(source, target_slot_number)
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Could not import save slot", str(error), parent=dialog)
+
+            def import_save_folder(target_slot_number: int) -> None:
+                source_path = filedialog.askdirectory(
+                    title="Choose a folder containing a Sekiro save",
+                    parent=dialog,
+                )
+                if source_path:
+                    import_save_source(Path(source_path), target_slot_number)
+
+            ttk.Button(
+                slot_export_actions,
+                text="Export complete save folder (.zip)",
+                command=export_save_folder,
+                style="Accent.TButton",
+            ).pack(side="left")
+            ttk.Button(
+                slot_export_actions,
+                text="Refresh slots",
+                command=refresh_slot_list,
+            ).pack(side="right")
+
+            def remove_slot(slot_number: int) -> None:
+                slot_state = slot_card_states.get(slot_number)
+                if slot_state not in {"populated", "stale"}:
+                    messagebox.showinfo(
+                        "Slot is empty",
+                        f"Save slot {slot_number} does not contain a character to remove.",
+                        parent=dialog,
+                    )
+                    return
+                slot_description = (
+                    "the stale roster entry"
+                    if slot_state == "stale"
+                    else f"the character in save slot {slot_number}"
+                )
+                if not messagebox.askyesno(
+                    "Remove save slot",
+                    f"Remove {slot_description} from save slot {slot_number}?\n\n"
+                    "A verified backup of the entire Sekiro save folder will be created "
+                    "first. This slot will be cleared from the active game save; use the "
+                    "Backups tab to restore the full save if needed.\n\n"
+                    "Close Sekiro before continuing.",
+                    parent=dialog,
+                ):
+                    return
+                current = save_folder_and_settings()
+                if current is None or not current["save_dir"]:
+                    return
+                try:
+                    save_manager.remove_sekiro_slot(
+                        Path(current["save_dir"]),
+                        slot_number,
+                        DATA_DIR,
+                    )
+                    refresh_slot_list()
+                    update_current_save_details()
+                    refresh_backups()
+                    refresh_profiles()
+                    self.status.set(f"Removed save slot {slot_number}")
+                    messagebox.showinfo(
+                        "Save slot removed",
+                        f"Slot {slot_number} was cleared. A full save backup is available "
+                        "in the Backups tab.",
+                        parent=dialog,
+                    )
+                except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
+                    messagebox.showerror("Could not remove save slot", str(error), parent=dialog)
 
             def update_backup_details(_event: object = None) -> None:
                 del _event
@@ -2108,6 +2696,7 @@ def launch_gui() -> None:
                     )
                     refresh_backups()
                     update_current_save_details()
+                    refresh_slot_list(show_errors=False)
                     self.status.set(f"Save restored from: {backup.name}")
                     messagebox.showinfo("Save restored", "The save folder was restored and verified.", parent=dialog)
                 except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
@@ -2229,6 +2818,7 @@ def launch_gui() -> None:
                     )
                     refresh_profiles()
                     update_current_save_details()
+                    refresh_slot_list(show_errors=False)
                     refresh_backups()
                     self.status.set(f"Active save profile: {profile}")
                 except (OSError, ValueError, shutil.Error, subprocess.SubprocessError) as error:
@@ -2297,10 +2887,12 @@ def launch_gui() -> None:
             ).pack(anchor="w")
             def refresh_save_manager_page() -> None:
                 update_current_save_details()
+                refresh_slot_list(show_errors=False)
                 refresh_backups()
                 refresh_profiles()
 
             self.refresh_save_manager = refresh_save_manager_page
+            refresh_slot_list(show_errors=False)
             self.save_manager_built = True
 
         def rename_installed_mod(self) -> None:
